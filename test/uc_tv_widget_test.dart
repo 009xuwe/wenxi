@@ -178,6 +178,8 @@ void main() {
     'Account menu exposes the TV grant and revocation preserves web login',
     (tester) async {
       await render(tester, authorized: true, menu: true);
+      await tester.ensureVisible(find.text('TV 播放授权'));
+      await tester.pumpAndSettle();
       await tester.tap(find.text('TV 播放授权'));
       await tester.pumpAndSettle();
       expect(find.text('TV 播放已就绪'), findsOneWidget);

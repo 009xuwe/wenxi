@@ -160,6 +160,9 @@ class UploadIO {
     required String access,
     required String secret,
     String token = '',
+    bool exactEndpoint = false,
+    String? contentType,
+    bool abortOnCancel = false,
   }) async {
     require(
       [endpoint, bucket, object, access, secret].every((s) => s.isNotEmpty),
@@ -168,7 +171,7 @@ class UploadIO {
     var base = Uri.parse(
       endpoint.contains('://') ? endpoint : 'https://$endpoint',
     );
-    if (!base.host.startsWith('$bucket.')) {
+    if (!exactEndpoint && !base.host.startsWith('$bucket.')) {
       base = base.replace(host: '$bucket.${base.host}');
     }
     final uri = base.replace(
@@ -185,7 +188,8 @@ class UploadIO {
       int? end,
     }) async {
       final date = HttpDate.format(clock().toUtc());
-      final type = start == null ? 'application/xml' : file.mimeType;
+      final type =
+          contentType ?? (start == null ? 'application/xml' : file.mimeType);
       final canonical = (parameters.keys.toList()..sort())
           .map(
             (key) => parameters[key]!.isEmpty ? key : '$key=${parameters[key]}',
@@ -208,7 +212,13 @@ class UploadIO {
           ? uri.toString()
           : query(uri.toString(), parameters);
       if (start != null) {
-        return send(address, start: start, end: end, headers: headers);
+        return send(
+          address,
+          start: start,
+          end: end,
+          headers: headers,
+          contentType: type,
+        );
       }
       final result = await http.request(
         method,
@@ -254,9 +264,12 @@ class UploadIO {
       require(!result.body.contains('<Error>'), '网盘未完成分段合并');
       complete = true;
     } finally {
-      if (!complete && RequestScope.current?.isCancelled != true) {
+      if (!complete &&
+          (abortOnCancel || RequestScope.current?.isCancelled != true)) {
         try {
-          await request('DELETE', {'uploadId': uploadId});
+          await RequestScope().run(
+            () => request('DELETE', {'uploadId': uploadId}),
+          );
         } catch (_) {}
       }
     }

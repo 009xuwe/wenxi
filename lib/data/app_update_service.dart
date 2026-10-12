@@ -6,6 +6,7 @@ import '../core/json.dart';
 import '../diagnostics/app_log.dart';
 import '../domain/downloads.dart';
 import '../domain/links.dart';
+import '../domain/github.dart';
 import '../domain/models.dart';
 import '../domain/remote_control.dart';
 import '../download/download_manager.dart';
@@ -56,13 +57,16 @@ class AppUpdateService extends ChangeNotifier {
       )
       .toString();
 
-  DownloadTask? taskFor(RemoteUpdate update) => downloads.tasks
-      .where(
-        (task) =>
-            task.spec.appUpdateKey == keyFor(update) &&
-            task.status != DownloadStatus.cancelled,
-      )
-      .firstOrNull;
+  DownloadTask? taskFor(RemoteUpdate update) {
+    final key = keyFor(update);
+    return downloads.tasks
+        .where(
+          (task) =>
+              task.spec.appUpdateKey == key &&
+              task.status != DownloadStatus.cancelled,
+        )
+        .firstOrNull;
+  }
 
   bool busy(RemoteUpdate update) => _pending.containsKey(keyFor(update));
   String stage(RemoteUpdate update) => _stages[keyFor(update)] ?? '';
@@ -120,21 +124,19 @@ class AppUpdateService extends ChangeNotifier {
         final existing = taskFor(update);
         if (existing != null) {
           if (existing.active) return;
-          if (existing.status == DownloadStatus.completed) {
-            if (redownload) {
-              await downloads.delete(existing.id);
-              _checkCurrent(update);
-            } else {
-              final availability = await files.inspect(existing.savedPath);
-              _checkCurrent(update);
-              if (availability == FileAvailability.present) return;
-              require(
-                availability == FileAvailability.missing,
-                '无法访问已下载的安装包，请恢复下载目录权限后重试',
-              );
-              await downloads.delete(existing.id);
-              _checkCurrent(update);
-            }
+          if (redownload) {
+            await downloads.delete(existing.id);
+            _checkCurrent(update);
+          } else if (existing.status == DownloadStatus.completed) {
+            final availability = await files.inspect(existing.savedPath);
+            _checkCurrent(update);
+            if (availability == FileAvailability.present) return;
+            require(
+              availability == FileAvailability.missing,
+              '无法访问已下载的安装包，请恢复下载目录权限后重试',
+            );
+            await downloads.delete(existing.id);
+            _checkCurrent(update);
           } else {
             await downloads.resume(existing.id);
             return;
@@ -148,6 +150,13 @@ class AppUpdateService extends ChangeNotifier {
 
   Future<DownloadSpec> resolve(RemoteUpdate update) async {
     final url = httpsUri(update.appDownloadUrl.toString());
+    // Release installation links remain independent of the optional GitHub
+    // account/provider and its API quota, including the fallback update feed.
+    if (GitHubLink.parse(url)?.isReleaseAsset == true) {
+      final name = url.pathSegments.lastOrNull ?? '';
+      AppUpdateInstaller.requirePackageName(name, platform);
+      return DownloadSpec(url: url.toString(), fileName: name);
+    }
     final links = LinkParser.parse(url.toString());
     require(links.length == 1, '更新链接无效，请使用浏览器更新');
     var link = links.single;

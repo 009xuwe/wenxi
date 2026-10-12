@@ -25,6 +25,89 @@ class PlaybackStore {
 
   Future<void> savePreferences(PlaybackPreferences value) =>
       store.put('playbackPreferences', value.toJson());
+
+  bool remembersFolder(String? key) =>
+      key != null &&
+      store.data.obj('playbackFolders').obj(key).boolean('enabled', true);
+
+  PlaybackPreferences preferencesFor(String? key) {
+    if (!remembersFolder(key)) return preferences;
+    final overrides = store.data
+        .obj('playbackFolders')
+        .obj(key!)
+        .obj('preferences');
+    return PlaybackPreferences.fromJson({
+      ...preferences.toJson(),
+      for (final entry in overrides.entries)
+        if (playbackFolderFields.contains(entry.key)) entry.key: entry.value,
+    });
+  }
+
+  PlaybackPlaylistOrder orderFor(String? key) {
+    if (!remembersFolder(key)) return PlaybackPlaylistOrder.source;
+    final order = store.data.obj('playbackFolders').obj(key!).str('order');
+    return PlaybackPlaylistOrder.values.firstWhere(
+      (value) => value.name == order,
+      orElse: () => PlaybackPlaylistOrder.source,
+    );
+  }
+
+  Future<void> rememberFolder(String key, bool enabled) =>
+      store.change((draft) {
+        final folders = draft.obj('playbackFolders');
+        final value = folders.obj(key)..['enabled'] = enabled;
+        _putFolder(draft, folders, key, value);
+      });
+
+  Future<void> saveOrder(String? key, PlaybackPlaylistOrder order) async {
+    if (!remembersFolder(key)) return;
+    await store.change((draft) {
+      final folders = draft.obj('playbackFolders');
+      final value = folders.obj(key!)..['order'] = order.name;
+      _putFolder(draft, folders, key, value);
+    });
+  }
+
+  Future<void> saveEffectivePreferences(
+    String? key,
+    PlaybackPreferences value,
+    PlaybackPreferences previous,
+  ) => store.change((draft) {
+    final global = PlaybackPreferences.fromJson(
+      draft.obj('playbackPreferences'),
+    ).toJson();
+    final folders = draft.obj('playbackFolders');
+    final folder = key == null ? <String, dynamic>{} : folders.obj(key);
+    final remember = key != null && folder.boolean('enabled', true);
+    final overrides = folder.obj('preferences');
+    final before = previous.toJson();
+    var folderChanged = false;
+    for (final entry in value.toJson().entries) {
+      if (encoded(entry.value) == encoded(before[entry.key])) continue;
+      if (remember && playbackFolderFields.contains(entry.key)) {
+        overrides[entry.key] = entry.value;
+        folderChanged = true;
+      } else {
+        global[entry.key] = entry.value;
+      }
+    }
+    draft['playbackPreferences'] = global;
+    if (folderChanged) {
+      folder['preferences'] = overrides;
+      _putFolder(draft, folders, key!, folder);
+    }
+  });
+
+  static void _putFolder(Json draft, Json folders, String key, Json value) {
+    folders.remove(key);
+    folders[key] = value;
+    draft['playbackFolders'] = Map.fromEntries(
+      folders.entries.skip(
+        (folders.length - historyLimit).clamp(0, folders.length),
+      ),
+    );
+  }
+
   VideoGeometry? videoGeometry(String key) {
     final value = store.data.obj('playbackVideoInfo')[key];
     return value is Map ? VideoGeometry.fromJson(asJson(value)) : null;

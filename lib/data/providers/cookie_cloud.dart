@@ -325,18 +325,39 @@ class CookieCloudConnector extends QuarkUcConnector {
         );
       } on _ShareDirectUnavailable catch (error) {
         guestFailure = error.message;
+      } on UcOriginalContentMismatch {
+        RequestScope.checkpoint();
+        // A restricted guest response says nothing about the selected account's
+        // access. Keep its cookies isolated and try the normal account route.
+        guestFailure = '游客接口未返回所选原文件';
+      } on HttpRequestFailure {
+        RequestScope.checkpoint();
+        if (quark || credential == null) rethrow;
+        guestFailure = '游客接口连接暂不可用';
       }
     }
     if (guest != null) return guest.copyWith(guestDownload: true);
     if (credential == null) {
       if (guestFailure != null) {
         throw AccountLoginRequired(
-          '${platform.shortName}游客下载暂不可用，已刷新分享凭证重试；请登录后重试（$guestFailure）',
+          '${platform.shortName}游客下载暂不可用，'
+          '${refreshed ? '已刷新分享凭证重试；' : ''}'
+          '请登录后重试（$guestFailure）',
         );
       }
       throw AccountLoginRequired('${platform.shortName}此文件不支持游客下载，请登录后重试');
     }
-    if (!accountEnabled) return null;
+    if (!accountEnabled) {
+      DiagnosticLog.event(
+        'share.download_fallback',
+        fields: {
+          'platform': platform.key,
+          'stage': 'account_transfer',
+          'reason': guestFailure ?? 'guest_access_restricted',
+        },
+      );
+      return null;
+    }
     DiagnosticLog.event(
       'share.download_fallback',
       fields: {
@@ -388,6 +409,14 @@ class CookieCloudConnector extends QuarkUcConnector {
     _sessions.checkpoint();
     if ({404, 405}.contains(response.status)) {
       throw _ShareDirectUnavailable('下载接口返回 HTTP ${response.status}');
+    }
+    if (!quark && {408, 429, 500, 502, 503, 504}.contains(response.status)) {
+      throw HttpRequestFailure(
+        'UC 游客下载暂不可用（HTTP ${response.status}），请稍后重试或登录账号下载',
+        kind: 'uc_guest',
+        status: response.status,
+        retryable: true,
+      );
     }
     if ({401, 403}.contains(response.status)) return null;
     late Json json;
@@ -459,7 +488,18 @@ class CookieCloudConnector extends QuarkUcConnector {
     );
     if ((file.size > 0 && total != file.size) ||
         (item.integer('size') > 0 && total != item.integer('size'))) {
-      if (!quark) throw const UcOriginalContentMismatch();
+      if (!quark) {
+        DiagnosticLog.event(
+          'uc.original_content_mismatch',
+          fields: {
+            'file': DiagnosticLog.reference(file.id),
+            'route': 'share',
+            'expectedBytes': file.size,
+            'receivedTotal': total,
+          },
+        );
+        throw const UcOriginalContentMismatch();
+      }
       throw const AppException('夸克返回的文件内容与所选文件不一致');
     }
     return DownloadSpec(
@@ -553,11 +593,10 @@ class CookieCloudConnector extends QuarkUcConnector {
     if (!quark &&
         spec.checksumType == 'md5' &&
         RegExp(r'^[0-9a-f]{32}$').hasMatch(spec.checksumValue ?? '')) {
-      final probe = await _sessions.transport.peek(
-        spec.url,
-        headers(''),
-        maxBytes: 1,
-      );
+      final probe = await _sessions.transport.peek(spec.url, {
+        ...headers(''),
+        'Accept-Encoding': 'identity',
+      }, maxBytes: 1);
       _sessions.checkpoint();
       require(probe.successful, 'UC 文件长度检查失败（HTTP ${probe.status}），请重试');
       final encoding = probe.header('content-encoding').toLowerCase();
@@ -580,6 +619,15 @@ class CookieCloudConnector extends QuarkUcConnector {
         'UC 未返回可验证的文件长度，请稍后重试',
       );
       if (expectedSize > 0 && expectedSize != total) {
+        DiagnosticLog.event(
+          'uc.original_content_mismatch',
+          fields: {
+            'file': DiagnosticLog.reference(file.id),
+            'route': 'web',
+            'expectedBytes': expectedSize,
+            'receivedTotal': total,
+          },
+        );
         throw const UcOriginalContentMismatch();
       }
       expectedSize = total!;

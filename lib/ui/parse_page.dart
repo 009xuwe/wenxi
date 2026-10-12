@@ -12,11 +12,13 @@ import '../core/operation_progress.dart';
 import '../diagnostics/app_log.dart';
 import '../data/http.dart';
 import '../domain/auth.dart';
+import '../domain/baidu_share_route.dart';
 import '../domain/links.dart';
 import '../domain/models.dart';
-import '../domain/xunlei_kouling.dart';
+import 'cloud_command_page.dart';
 import '../platform/file_access.dart';
 import 'browser_page.dart';
+import 'baidu_share_route_picker.dart';
 import 'common.dart';
 import 'login_page.dart';
 import 'recent_playback_page.dart';
@@ -42,6 +44,7 @@ class ParsePageState extends State<ParsePage> {
   String stage = '', error = '';
   String? _recognizedText;
   CloudPlatform? _loginPlatform;
+  BaiduShareRoute _baiduRoute = BaiduShareRoute.publicParser;
   RequestScope? _request;
   ParsedLink? get current => links.elementAtOrNull(selected);
 
@@ -239,42 +242,11 @@ class ParsePageState extends State<ParsePage> {
       'parse.start',
       fields: {'kind': link?.kind.name, 'platform': link?.platform?.name},
     );
-    if (link == null && XunleiKouling.looksLike(input.text)) {
-      final generation = ++_generation;
-      setState(() {
-        working = true;
-        error = '';
-        stage = '正在解析迅雷中文口令…';
-      });
-      try {
-        final resolved = await widget.services.cloud.resolveXunleiKouling(
-          input.text,
-        );
-        if (!_current(generation)) return;
-        setState(() {
-          working = false;
-          stage = '';
-        });
-        _replaceInput(resolved);
-        await parse();
-      } catch (e, stack) {
-        if (!_current(generation)) return;
-        DiagnosticLog.error('parse.kouling_failed', e, stack);
-        setState(() => error = errorText(e));
-      } finally {
-        if (_current(generation)) {
-          _progress.close();
-          setState(() {
-            working = false;
-            stage = '';
-          });
-        }
-      }
-      return;
-    }
     if (input.text.trim().isEmpty || link == null) {
       setState(
-        () => error = input.text.trim().isEmpty ? '请输入内容' : '未识别到有效链接，请检查分享内容',
+        () => error = input.text.trim().isEmpty
+            ? '请输入内容'
+            : '未识别到有效链接，网盘口令请使用下方「口令解析」',
       );
       focus.requestFocus();
       return;
@@ -321,7 +293,9 @@ class ParsePageState extends State<ParsePage> {
       }
       final platform = link.platform!;
       widget.services.control.checkCloud(platform);
-      if (platform.shareRequiresAccount &&
+      if ((platform.shareRequiresAccount ||
+              platform == CloudPlatform.baidu &&
+                  _baiduRoute == BaiduShareRoute.account) &&
           !LoginCredentials.stored(
             platform,
             widget.services.vault.credential(platform),
@@ -352,7 +326,10 @@ class ParsePageState extends State<ParsePage> {
       final result = await scope
           .run(
             () => _progress.run(() async {
-              final session = await widget.services.cloud.share(link);
+              final session = await widget.services.cloud.share(
+                link,
+                baiduRoute: _baiduRoute,
+              );
               checkpoint();
               setState(() => stage = '正在读取文件列表…');
               final files = await widget.services.cloud.list(
@@ -584,7 +561,7 @@ class ParsePageState extends State<ParsePage> {
   }) => Container(
     padding: padding,
     decoration: BoxDecoration(
-      color: Theme.of(context).colorScheme.surface,
+      color: backgroundSurface(context),
       borderRadius: BorderRadius.circular(desktop ? 16 : 22),
       border: Border.all(color: border(context), width: .7),
       boxShadow: desktop
@@ -623,7 +600,9 @@ class ParsePageState extends State<ParsePage> {
             key: const Key('parse-recognition'),
             style: TextStyle(
               fontSize: 12,
-              color: current == null ? secondary(context) : brandBlue,
+              color: current == null
+                  ? secondary(context)
+                  : themeAccent(context),
             ),
           ),
         ],
@@ -677,7 +656,11 @@ class ParsePageState extends State<ParsePage> {
         padding: const EdgeInsets.symmetric(vertical: 2),
         child: Row(
           children: [
-            const Icon(CupertinoIcons.doc_text, color: brandBlue, size: 27),
+            Icon(
+              CupertinoIcons.doc_text,
+              color: themeAccent(context),
+              size: 27,
+            ),
             const SizedBox(width: 17),
             Expanded(
               child: Column(
@@ -696,7 +679,9 @@ class ParsePageState extends State<ParsePage> {
                     style: TextStyle(
                       fontSize: 13,
                       fontWeight: FontWeight.w600,
-                      color: current == null ? secondary(context) : brandBlue,
+                      color: current == null
+                          ? secondary(context)
+                          : themeAccent(context),
                     ),
                   ),
                 ],
@@ -710,8 +695,8 @@ class ParsePageState extends State<ParsePage> {
       key: const Key('parse-history'),
       onPressed: working ? null : _history,
       style: TextButton.styleFrom(
-        backgroundColor: brandBlue.withValues(alpha: .11),
-        foregroundColor: brandBlue,
+        backgroundColor: themeAccent(context).withValues(alpha: .11),
+        foregroundColor: themeAccent(context),
         minimumSize: const Size(0, 32),
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
         shape: const StadiumBorder(),
@@ -784,8 +769,8 @@ class ParsePageState extends State<ParsePage> {
         onPressed: working ? null : addTorrent,
         style: FilledButton.styleFrom(
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 16),
-          disabledBackgroundColor: brandBlue.withValues(alpha: .09),
-          disabledForegroundColor: brandBlue.withValues(alpha: .55),
+          disabledBackgroundColor: themeAccent(context).withValues(alpha: .09),
+          disabledForegroundColor: themeAccent(context).withValues(alpha: .55),
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(17),
           ),
@@ -807,7 +792,7 @@ class ParsePageState extends State<ParsePage> {
       key: const Key('parse-start'),
       onPressed: working || current == null ? null : parse,
       style: FilledButton.styleFrom(
-        backgroundColor: brandBlue,
+        backgroundColor: themeAccent(context),
         disabledBackgroundColor: Theme.of(context).brightness == Brightness.dark
             ? const Color(0xff3a3a3c)
             : const Color(0xffd2d2d7),
@@ -884,7 +869,9 @@ class ParsePageState extends State<ParsePage> {
         border: desktop ? outline : InputBorder.none,
         enabledBorder: desktop ? outline : InputBorder.none,
         focusedBorder: desktop
-            ? outline.copyWith(borderSide: const BorderSide(color: brandBlue))
+            ? outline.copyWith(
+                borderSide: BorderSide(color: themeAccent(context)),
+              )
             : InputBorder.none,
         disabledBorder: desktop ? outline : InputBorder.none,
       ),
@@ -1053,7 +1040,7 @@ class ParsePageState extends State<ParsePage> {
                     focusedBorder: desktop
                         ? OutlineInputBorder(
                             borderRadius: BorderRadius.circular(12),
-                            borderSide: const BorderSide(color: brandBlue),
+                            borderSide: BorderSide(color: themeAccent(context)),
                           )
                         : InputBorder.none,
                     suffixIconConstraints: const BoxConstraints(
@@ -1076,6 +1063,21 @@ class ParsePageState extends State<ParsePage> {
                 if (!desktop)
                   Divider(height: 1, thickness: .6, color: border(context)),
                 _codeInput(context, link, hint, desktop: desktop),
+                if (link?.platform == CloudPlatform.baidu &&
+                    link?.kind == LinkKind.cloudShare)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 4, bottom: 10),
+                    child: BaiduShareRoutePicker(
+                      value: _baiduRoute,
+                      onChanged: working
+                          ? null
+                          : (value) => setState(() {
+                              _baiduRoute = value;
+                              error = '';
+                              _loginPlatform = null;
+                            }),
+                    ),
+                  ),
                 if (links.length > 1) ...[
                   const SizedBox(height: 8),
                   Text(
@@ -1091,7 +1093,9 @@ class ParsePageState extends State<ParsePage> {
                         i == selected
                             ? CupertinoIcons.checkmark_circle_fill
                             : CupertinoIcons.circle,
-                        color: i == selected ? brandBlue : secondary(context),
+                        color: i == selected
+                            ? themeAccent(context)
+                            : secondary(context),
                         size: 22,
                       ),
                       title: Text(_label(links[i])),
@@ -1117,7 +1121,7 @@ class ParsePageState extends State<ParsePage> {
                     margin: const EdgeInsets.only(bottom: 12),
                     padding: const EdgeInsets.all(12),
                     decoration: BoxDecoration(
-                      color: brandBlue.withValues(alpha: .055),
+                      color: themeAccent(context).withValues(alpha: .055),
                       borderRadius: BorderRadius.circular(12),
                     ),
                     child: Column(
@@ -1177,6 +1181,55 @@ class ParsePageState extends State<ParsePage> {
               ],
             ),
           );
+          final parseTools = Column(
+            children: [
+              form,
+              const SizedBox(height: 18),
+              _card(
+                context,
+                desktop: desktop,
+                padding: EdgeInsets.zero,
+                child: ListTile(
+                  key: const Key('parse-command'),
+                  contentPadding: const EdgeInsets.symmetric(
+                    horizontal: 18,
+                    vertical: 5,
+                  ),
+                  leading: Container(
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      color: themeAccent(context).withValues(alpha: .10),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Icon(
+                      Icons.document_scanner_outlined,
+                      color: themeAccent(context),
+                    ),
+                  ),
+                  title: const Text(
+                    '口令解析',
+                    style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+                  ),
+                  subtitle: const Text(
+                    '夸克 · 迅雷 · UC',
+                    style: TextStyle(fontSize: 12),
+                  ),
+                  trailing: const Icon(CupertinoIcons.chevron_right, size: 17),
+                  onTap: working
+                      ? null
+                      : () => Navigator.push<void>(
+                          context,
+                          MaterialPageRoute(
+                            builder: (_) => CloudCommandPage(
+                              widget.services,
+                              initialText: links.isEmpty ? input.text : '',
+                            ),
+                          ),
+                        ),
+                ),
+              ),
+            ],
+          );
           final support = desktop
               ? _desktopSupport(context)
               : _card(
@@ -1185,10 +1238,10 @@ class ParsePageState extends State<ParsePage> {
                   child: Row(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      const Icon(
+                      Icon(
                         CupertinoIcons.checkmark_seal_fill,
                         size: 25,
-                        color: brandBlue,
+                        color: themeAccent(context),
                       ),
                       const SizedBox(width: 14),
                       Expanded(
@@ -1254,7 +1307,7 @@ class ParsePageState extends State<ParsePage> {
                   Row(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Expanded(child: form),
+                      Expanded(child: parseTools),
                       const SizedBox(width: 22),
                       SizedBox(
                         width: 252,
@@ -1271,7 +1324,7 @@ class ParsePageState extends State<ParsePage> {
                     ],
                   )
                 else ...[
-                  form,
+                  parseTools,
                   const SizedBox(height: 18),
                   if (bounds.maxWidth >= 680 &&
                       MediaQuery.textScalerOf(context).scale(14) <= 21)
@@ -1303,7 +1356,7 @@ class ParsePageState extends State<ParsePage> {
               28 + MediaQuery.paddingOf(context).bottom,
             ),
             children: [
-              form,
+              parseTools,
               const SizedBox(height: 18),
               favorites,
               const SizedBox(height: 18),
@@ -1324,15 +1377,26 @@ Future<bool> directDownloadDialog(
   String initial = '',
   String fileName = '',
   Map<String, String> headers = const {},
+  bool external = false,
 }) async {
-  final spec = await showDialog<DownloadSpec>(
+  final selection = await showDialog<({DownloadSpec spec, int connections})>(
     context: context,
-    builder: (_) => _DirectDialog(initial, fileName, headers),
+    barrierDismissible: !external,
+    builder: (_) => _DirectDialog(
+      initial,
+      fileName,
+      headers,
+      services.settings.threads,
+      external: external,
+    ),
   );
-  if (spec == null || !context.mounted) return false;
+  if (selection == null || !context.mounted) return false;
   final id = await busy(
     context,
-    () => services.downloads.enqueue(spec),
+    () => services.downloads.enqueue(
+      selection.spec,
+      connections: selection.connections,
+    ),
     label: '添加下载…',
   );
   if (id != null && context.mounted) {
@@ -1342,10 +1406,18 @@ Future<bool> directDownloadDialog(
 }
 
 class _DirectDialog extends StatefulWidget {
-  const _DirectDialog(this.initial, this.fileName, this.headers);
+  const _DirectDialog(
+    this.initial,
+    this.fileName,
+    this.headers,
+    this.connections, {
+    this.external = false,
+  });
   final String initial;
   final String fileName;
   final Map<String, String> headers;
+  final int connections;
+  final bool external;
   @override
   State<_DirectDialog> createState() => _DirectDialogState();
 }
@@ -1361,11 +1433,12 @@ class _DirectDialogState extends State<_DirectDialog> {
     ),
   );
   late final headers = TextEditingController(text: jsonEncode(widget.headers));
+  late final connections = TextEditingController(text: '${widget.connections}');
   String error = '';
   bool advanced = false;
   @override
   void dispose() {
-    for (final c in [url, name, headers]) {
+    for (final c in [url, name, headers, connections]) {
       c.dispose();
     }
     super.dispose();
@@ -1375,6 +1448,11 @@ class _DirectDialogState extends State<_DirectDialog> {
     try {
       final normalized = LinkParser.normalize(url.text),
           decoded = jsonDecode(headers.text);
+      final count = int.tryParse(connections.text.trim());
+      require(
+        count != null && count >= 1 && count <= 512,
+        '线程数请输入 1–512 之间的整数',
+      );
       require(
         decoded is Map && decoded.values.every((v) => v is String),
         '请求头应为 JSON 字符串对象',
@@ -1386,14 +1464,14 @@ class _DirectDialogState extends State<_DirectDialog> {
         ),
         '请求头不能包含换行',
       );
-      Navigator.pop(
-        context,
-        DownloadSpec(
+      Navigator.pop(context, (
+        spec: DownloadSpec(
           url: normalized,
           fileName: safeFileName(name.text),
           headers: parsed,
         ),
-      );
+        connections: count!,
+      ));
     } catch (e) {
       setState(() => error = e is AppException ? e.message : '请检查链接和请求头格式');
     }
@@ -1407,7 +1485,15 @@ class _DirectDialogState extends State<_DirectDialog> {
       child: SingleChildScrollView(
         child: Column(
           mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            if (widget.external) ...[
+              Text(
+                '已接收外部应用的下载链接，请确认本次下载设置。',
+                style: Theme.of(context).textTheme.bodyMedium,
+              ),
+              const SizedBox(height: 16),
+            ],
             TextField(
               controller: url,
               decoration: const InputDecoration(labelText: 'HTTP / HTTPS 链接'),
@@ -1418,6 +1504,30 @@ class _DirectDialogState extends State<_DirectDialog> {
             TextField(
               controller: name,
               decoration: const InputDecoration(labelText: '保存文件名'),
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: connections,
+              keyboardType: TextInputType.number,
+              inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+              decoration: const InputDecoration(
+                labelText: '本次下载线程数',
+                suffixText: '线程',
+                helperText: '1–512，仅用于本次任务；实际连接数由服务器决定',
+                helperMaxLines: 2,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              children: [
+                for (final count in [1, 8, 16, 32, 64])
+                  ActionChip(
+                    label: Text('$count'),
+                    tooltip: '$count 个线程',
+                    onPressed: () => connections.text = '$count',
+                  ),
+              ],
             ),
             const SizedBox(height: 8),
             SwitchListTile(

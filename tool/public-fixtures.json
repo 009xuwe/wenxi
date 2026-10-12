@@ -6,6 +6,10 @@
     ],
     "reason": "Decrypted and reviewed JVM compatibility vector: fixture/test-only credentials, fixture UUID and a repeated-character device ID. See test/fixtures/README.md."
   },
+  "test/baidu_public_parser_test.dart": {
+    "sha256": "d3828d54d66f9044e7d3a5f8c2a688cf3a7332092eac4ae831f437745af712f6",
+    "reason": "Synthetic user:password URL exercises rejection of credential-bearing parser download links; the fixture transport never accesses the network."
+  },
   "test/remote_control_resilience_test.dart": {
     "sha256": "8a0456a9d1c9cfa33a9cf96a07ef76bd1e9eafd71192b845ed3c2bb6d6f5767e",
     "reason": "Synthetic credential-bearing URLs on reserved example/test hosts exercise rejection of unsafe URLs."

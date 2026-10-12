@@ -2,6 +2,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:asterlink/app_services.dart';
+import 'package:asterlink/core/json.dart';
 import 'package:asterlink/data/state_store.dart';
 import 'package:asterlink/main.dart';
 import 'package:asterlink/platform/external_open.dart';
@@ -16,11 +17,18 @@ void main() {
   late AppServices services;
   final incoming = <Map<String, Object?>>[];
   final events = <String>[];
+  final externalChannel = Platform.isWindows
+      ? windowsExternalOpenChannel
+      : nativeChannel;
+
+  Finder field(String label) => find.byWidgetPredicate(
+    (widget) => widget is TextField && widget.decoration?.labelText == label,
+  );
 
   setUp(() {
     incoming.clear();
     events.clear();
-    messenger.setMockMethodCallHandler(nativeChannel, (call) async {
+    messenger.setMockMethodCallHandler(externalChannel, (call) async {
       if (call.method != 'takeExternalOpens') return null;
       final values = List.of(incoming);
       incoming.clear();
@@ -73,7 +81,7 @@ void main() {
         }
         expect(closed, isTrue);
         services.store.dispose();
-        messenger.setMockMethodCallHandler(nativeChannel, null);
+        messenger.setMockMethodCallHandler(externalChannel, null);
       }
     });
   }
@@ -102,6 +110,11 @@ void main() {
       'https://example.test/get?token=signed',
     );
     expect(field('保存文件名').controller!.text, '应用.apk');
+    expect(field('本次下载线程数').controller!.text, '64');
+    await tester.tapAt(const Offset(2, 2));
+    await tester.pumpAndSettle();
+    expect(find.text('新建下载'), findsOneWidget);
+    await tester.ensureVisible(find.text('自定义请求头'));
     await tester.tap(find.text('自定义请求头'));
     await tester.pumpAndSettle();
     expect(field('JSON 请求头').controller!.text, contains('"Cookie":"caller"'));
@@ -112,6 +125,48 @@ void main() {
     expect(find.text('新建下载'), findsNothing);
     expect(services.downloads.tasks, isEmpty);
   });
+
+  scenario(
+    'each invocation confirms its own threads without changing settings',
+    (tester) async {
+      await render(tester);
+      await deliver({
+        'id': 'threads-1',
+        'kind': 'download',
+        'uri': 'https://download.baidupcs.com/external.apk',
+      });
+      await tester.pumpAndSettle();
+      await tester.enterText(field('本次下载线程数'), '0');
+      await tester.tap(find.text('添加下载'));
+      await tester.pumpAndSettle();
+      expect(find.text('线程数请输入 1–512 之间的整数'), findsOneWidget);
+      expect(services.downloads.tasks, isEmpty);
+      await tester.enterText(field('本次下载线程数'), '12');
+      await tester.runAsync(() async {
+        await tester.tap(find.text('添加下载'));
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      });
+      await tester.pumpAndSettle();
+      expect(find.text('新建下载'), findsNothing);
+      expect(services.downloads.tasks.single.connections, 12);
+      expect(
+        services.store.data.list('tasks').single.integer('connections'),
+        12,
+      );
+      expect(services.settings.threads, 64);
+      await deliver({
+        'id': 'threads-2',
+        'kind': 'download',
+        'uri': 'https://example.test/second.apk',
+      });
+      await tester.pumpAndSettle();
+      expect(find.text('新建下载'), findsOneWidget);
+      expect(tester.widget<TextField>(field('本次下载线程数')).controller!.text, '64');
+      await tester.tap(find.text('取消'));
+      await tester.pumpAndSettle();
+      expect(services.downloads.tasks, hasLength(1));
+    },
+  );
 
   scenario(
     'warm download requests wait until the visible download dialog closes',

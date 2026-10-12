@@ -19,10 +19,18 @@ enum OperationStage {
 enum OperationStepStatus { running, completed, failed, cancelled }
 
 class OperationStep {
-  const OperationStep(this.id, this.stage, this.status);
+  const OperationStep(
+    this.id,
+    this.stage,
+    this.status, {
+    this.itemsRead,
+    this.waitingForRetry = false,
+  });
   final int id;
   final OperationStage stage;
   final OperationStepStatus status;
+  final int? itemsRead;
+  final bool waitingForRetry;
 }
 
 class _ProgressBinding {
@@ -32,11 +40,12 @@ class _ProgressBinding {
 }
 
 /// Progress belongs to the operation that started it, including across account
-/// scopes. Only fixed stage names are exposed; links and credentials stay out.
+/// scopes. Only fixed stages and counts are exposed; links and credentials stay out.
 class OperationProgress extends ValueNotifier<List<OperationStep>> {
   OperationProgress() : super(const []);
   static final _key = Object();
   static final _stageKey = Object();
+  static final _activeStepsKey = Object();
   static OperationStage? get currentStage =>
       Zone.current[_stageKey] as OperationStage?;
   final _notificationZone = Zone.current;
@@ -70,7 +79,10 @@ class OperationProgress extends ValueNotifier<List<OperationStep>> {
         (binding, binding.progress._start(binding.generation, stage)),
     ];
     try {
-      final result = await runZoned(action, zoneValues: {_stageKey: stage});
+      final result = await runZoned(
+        action,
+        zoneValues: {_stageKey: stage, _activeStepsKey: started},
+      );
       for (final (binding, id) in started) {
         binding.progress._finish(
           binding.generation,
@@ -89,6 +101,40 @@ class OperationProgress extends ValueNotifier<List<OperationStep>> {
       }
       rethrow;
     }
+  }
+
+  static void reportFiles(int count, {bool waitingForRetry = false}) {
+    if (count < 0 || currentStage != OperationStage.readFiles) return;
+    final active =
+        Zone.current[_activeStepsKey] as List<(_ProgressBinding, int)>? ??
+        const [];
+    for (final (binding, id) in active) {
+      binding.progress._files(binding.generation, id, count, waitingForRetry);
+    }
+  }
+
+  void _files(int generation, int id, int count, bool waitingForRetry) {
+    if (!_current(generation)) return;
+    final index = value.indexWhere(
+      (step) =>
+          step.id == id &&
+          step.stage == OperationStage.readFiles &&
+          step.status == OperationStepStatus.running,
+    );
+    if (index < 0) return;
+    final step = value[index];
+    if (step.itemsRead == count && step.waitingForRetry == waitingForRetry) {
+      return;
+    }
+    final entries = value.toList();
+    entries[index] = OperationStep(
+      id,
+      step.stage,
+      step.status,
+      itemsRead: count,
+      waitingForRetry: waitingForRetry,
+    );
+    _publish(entries);
   }
 
   bool _current(int generation) => !_closed && generation == _generation;
@@ -116,7 +162,9 @@ class OperationProgress extends ValueNotifier<List<OperationStep>> {
     if (!_current(generation)) return;
     _publish([
       for (final step in value)
-        step.id == id ? OperationStep(id, step.stage, status) : step,
+        step.id == id
+            ? OperationStep(id, step.stage, status, itemsRead: step.itemsRead)
+            : step,
     ]);
   }
 
@@ -139,6 +187,7 @@ class OperationProgress extends ValueNotifier<List<OperationStep>> {
                   cancelled
                       ? OperationStepStatus.cancelled
                       : OperationStepStatus.failed,
+                  itemsRead: step.itemsRead,
                 )
               : step,
       ]);

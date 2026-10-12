@@ -21,11 +21,13 @@ import '../domain/tianyi_web_login.dart';
 import '../diagnostics/web_login_diagnostics.dart';
 import 'common.dart';
 import 'native_password_login_page.dart';
+import 'github_login_page.dart';
 import 'guangya_sms_login_page.dart';
 import 'login_webview.dart';
 import 'uc_tv_authorization_page.dart';
 import 'cloud_accounts_page.dart';
 import 'account_cookie.dart';
+import 'account_info_page.dart';
 export 'native_password_login_page.dart';
 export 'login_webview.dart' show webSettings, desktopLoginViewportScript;
 
@@ -58,9 +60,11 @@ Future<void> openLogin(
       context,
       MaterialPageRoute(
         builder: (_) => switch (platform) {
+          CloudPlatform.github => GitHubLoginPage(services, accountId: owner),
           CloudPlatform.xunlei ||
           CloudPlatform.ctfile ||
           CloudPlatform.feijipan ||
+          CloudPlatform.pikpak ||
           CloudPlatform.pan123 ||
           CloudPlatform.lanzou ||
           CloudPlatform.tianyi ||
@@ -197,6 +201,7 @@ Future<void> accountMenu(
     platform,
     services.vault.credentialFor(platform, accountId),
   );
+  final loginInfo = savedAccountLoginInfo(services.vault, platform, accountId);
   final action = await showModalBottomSheet<String>(
     context: context,
     showDragHandle: true,
@@ -210,8 +215,16 @@ Future<void> accountMenu(
               title: Text(platform.label),
             ),
             ListTile(
+              leading: const Icon(CupertinoIcons.slider_horizontal_3),
+              title: const Text('账号配置'),
+              subtitle: const Text('查看与复制 Cookie、Token 等登录信息'),
+              onTap: () => Navigator.pop(context, 'info'),
+            ),
+            ListTile(
               leading: const Icon(CupertinoIcons.arrow_clockwise),
-              title: const Text('刷新账号容量'),
+              title: Text(
+                platform == CloudPlatform.github ? '刷新账号信息' : '刷新账号容量',
+              ),
               onTap: () => Navigator.pop(context, 'refresh'),
             ),
             ListTile(
@@ -232,11 +245,11 @@ Future<void> accountMenu(
               title: const Text('手动填写登录信息'),
               onTap: () => Navigator.pop(context, 'manual'),
             ),
-            if (stored)
+            if (services.vault.credentialFor(platform, accountId) != null)
               ListTile(
                 leading: const Icon(CupertinoIcons.doc_on_doc),
-                title: const Text('复制 Cookie'),
-                onTap: () => Navigator.pop(context, 'copyCookie'),
+                title: Text(loginInfo.copyLabel),
+                onTap: () => Navigator.pop(context, 'copyLogin'),
               ),
             if (platform == CloudPlatform.uc && stored)
               ListTile(
@@ -264,18 +277,21 @@ Future<void> accountMenu(
   if (!context.mounted) return;
   if (action != null &&
       action != 'logout' &&
-      action != 'copyCookie' &&
+      action != 'copyLogin' &&
+      action != 'info' &&
       !allowCloudAction(context, services.control, platform)) {
     return;
   }
   switch (action) {
-    case 'copyCookie':
-      await copyCloudAccountCookie(
+    case 'copyLogin':
+      await copyCloudAccountLoginInfo(
         context,
         services.vault,
         platform,
         accountId,
       );
+    case 'info':
+      await openCloudAccountInfo(context, services.vault, platform, accountId);
     case 'accounts':
       await Navigator.push<void>(
         context,
@@ -290,7 +306,11 @@ Future<void> accountMenu(
     case 'manual':
       await Navigator.push<void>(
         context,
-        MaterialPageRoute(builder: (_) => ManualLoginPage(services, platform)),
+        MaterialPageRoute(
+          builder: (_) => platform == CloudPlatform.github
+              ? GitHubLoginPage(services, accountId: accountId)
+              : ManualLoginPage(services, platform),
+        ),
       );
     case 'ucTv':
       if (await openUcTvAuthorization(context, services) && context.mounted) {
@@ -1096,7 +1116,7 @@ class _WebLoginPageState extends State<WebLoginPage>
                 Icon(
                   checking ? CupertinoIcons.clock : CupertinoIcons.lock_shield,
                   size: 16,
-                  color: brandBlue,
+                  color: themeAccent(context),
                 ),
                 const SizedBox(width: 8),
                 Expanded(

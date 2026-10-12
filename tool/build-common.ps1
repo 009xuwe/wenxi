@@ -36,18 +36,19 @@ function Get-AsterLinkBuildSettings {
     $settings = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $BuildConfig).ProviderPath) | ConvertFrom-Json
     $expected = @('controlEnabled', 'controlUrl', 'githubRepository', 'applicationId', 'metricsAppKey', 'metricsChannel')
     $names = @($settings.PSObject.Properties.Name)
-    if (@(Compare-Object ($expected | Sort-Object) ($names | Sort-Object)).Count -ne 0) {
-        throw 'Build config must have exactly the fields in config/build.community.json.'
+    if (@(Compare-Object ($expected | Sort-Object) ($names | Where-Object { $_ -ne 'announcementsUrl' } | Sort-Object)).Count -ne 0) {
+        throw 'Build config must have the required fields in config/build.community.json, plus optional announcementsUrl.'
     }
+    if ($names -notcontains 'announcementsUrl') { $settings | Add-Member -NotePropertyName announcementsUrl -NotePropertyValue '' }
     foreach ($name in @('controlEnabled')) {
         if ($settings.$name -isnot [bool]) { throw "Build config field $name must be a JSON boolean." }
     }
-    foreach ($name in @('controlUrl', 'githubRepository', 'applicationId', 'metricsAppKey', 'metricsChannel')) {
+    foreach ($name in @('controlUrl', 'announcementsUrl', 'githubRepository', 'applicationId', 'metricsAppKey', 'metricsChannel')) {
         if ($settings.$name -isnot [string]) { throw "Build config field $name must be a string." }
         $settings.$name = $settings.$name.Trim()
     }
     if ($ConfigUrl) { $settings.controlUrl = $ConfigUrl; $settings.controlEnabled = $true }
-    if ($Offline) { $settings.controlEnabled = $false; $settings.githubRepository = '' }
+    if ($Offline) { $settings.controlEnabled = $false; $settings.githubRepository = ''; $settings.announcementsUrl = '' }
     if ($settings.controlEnabled) {
         $uri = $null
         if (-not [Uri]::TryCreate($settings.controlUrl, [UriKind]::Absolute, [ref]$uri) -or
@@ -55,6 +56,21 @@ function Get-AsterLinkBuildSettings {
             $uri.UserInfo -or $uri.Fragment -or $settings.controlUrl.Length -gt 2048 -or
             $settings.controlUrl -match '[\s\x00-\x1f\x7f\\]') {
             throw 'controlUrl must be an absolute HTTPS URL without credentials or a fragment.'
+        }
+    }
+    if (-not $settings.announcementsUrl -and $settings.controlEnabled) {
+        $controlUri = [Uri]$settings.controlUrl
+        if (-not $controlUri.Query -and $controlUri.AbsolutePath.EndsWith('.json', [StringComparison]::OrdinalIgnoreCase)) {
+            $settings.announcementsUrl = [Uri]::new($controlUri, 'announcements.json').AbsoluteUri
+        }
+    }
+    if ($settings.announcementsUrl) {
+        $announcementsUri = $null
+        if (-not [Uri]::TryCreate($settings.announcementsUrl, [UriKind]::Absolute, [ref]$announcementsUri) -or
+            $announcementsUri.Scheme -ne 'https' -or -not $announcementsUri.Host -or $announcementsUri.Port -lt 1 -or
+            $announcementsUri.UserInfo -or $announcementsUri.Fragment -or $settings.announcementsUrl.Length -gt 2048 -or
+            $settings.announcementsUrl -match '[\s\x00-\x1f\x7f\\]') {
+            throw 'announcementsUrl must be an absolute HTTPS URL without credentials or a fragment.'
         }
     }
     if ($settings.githubRepository -and $settings.githubRepository -notmatch '^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}$') {
@@ -74,6 +90,7 @@ function Get-AsterLinkBuildSettings {
 
 function Get-AsterLinkDartDefines {
     param($Settings)
+    "--dart-define=ASTERLINK_ANNOUNCEMENTS_URL=$($Settings.announcementsUrl)"
     @(
         "--dart-define=ASTERLINK_CONTROL_ENABLED=$($Settings.controlEnabled.ToString().ToLowerInvariant())"
         "--dart-define=ASTERLINK_CONTROL_URL=$($Settings.controlUrl)"
@@ -91,6 +108,17 @@ function Get-AsterLinkDartDefines {
             throw 'Invalid private Baidu API build configuration.'
         }
         "--dart-define-from-file=$baiduConfig"
+    }
+    $commandConfig = Join-Path (Split-Path -Parent $PSScriptRoot) '.local/cloud-command.defines.json'
+    if (Test-Path -LiteralPath $commandConfig -PathType Leaf) {
+        $commandKeys = Get-Content -Raw -Encoding utf8 -LiteralPath $commandConfig | ConvertFrom-Json
+        foreach ($entry in @(@('ASTERLINK_QUARK_COMMAND_KEY', 88), @('ASTERLINK_UC_COMMAND_KEY', 24))) {
+            $value = $commandKeys.($entry[0])
+            if ($value -isnot [string] -or [Text.Encoding]::UTF8.GetByteCount($value) -ne $entry[1]) {
+                throw 'Invalid private cloud command build configuration.'
+            }
+        }
+        "--dart-define-from-file=$commandConfig"
     }
 }
 

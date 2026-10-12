@@ -204,7 +204,7 @@ class _StartupFailurePageState extends State<StartupFailurePage> {
                         ? CupertinoIcons.checkmark_shield
                         : CupertinoIcons.lock_shield,
                     size: 48,
-                    color: brandBlue,
+                    color: themeAccent(context),
                   ),
                   const SizedBox(height: 20),
                   Text(

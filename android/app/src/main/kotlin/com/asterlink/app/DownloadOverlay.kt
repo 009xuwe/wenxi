@@ -1,6 +1,7 @@
 package com.asterlink.app
 
 import android.app.Activity
+import android.animation.ValueAnimator
 import android.content.ComponentCallbacks
 import android.content.Context
 import android.content.Intent
@@ -18,6 +19,10 @@ import android.graphics.drawable.RippleDrawable
 import android.graphics.ColorFilter
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.os.PowerManager
+import android.os.SystemClock
 import android.provider.Settings
 import android.text.TextUtils
 import android.view.Gravity
@@ -26,6 +31,7 @@ import android.view.View
 import android.view.ViewConfiguration
 import android.view.WindowInsets
 import android.view.WindowManager
+import android.view.animation.DecelerateInterpolator
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ProgressBar
@@ -44,7 +50,7 @@ internal data class OverlayBounds(val x: Int, val y: Int, val width: Int, val he
     }
 }
 
-/** Application-owned view; the existing retained engine remains the sole download coordinator. */
+/** Application-owned view; the retained Flutter engine owns both transfer queues. */
 class DownloadOverlay(
     private val app: Context,
     private val activity: () -> Activity?,
@@ -73,12 +79,18 @@ class DownloadOverlay(
         private set
     val visible get() = root != null
     internal val contentView get() = root
-    internal val currentBounds get() = if (collapsed) bubbleBounds else panelBounds
+    internal val currentBounds get() = if (collapsed) visibleBubbleBounds() else panelBounds
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var bubbleDocked = false
+    private var bubbleDockedRight = false
+    private var bubbleTouching = false
+    private var lastBubbleInteraction = 0L
+    private val dockAfterIdle = Runnable { dockBubble() }
     private var subscribed = false
     private var summary: TextView? = null
     private var percentage: TextView? = null
-    private var transferSpeed: TextView? = null
-    private var transferred: TextView? = null
+    private var downloadSpeedLabel: TextView? = null
+    private var uploadSpeedLabel: TextView? = null
     private var overall: ProgressBar? = null
     private var rows: LinearLayout? = null
     private var bubble: ProgressBall? = null
@@ -88,14 +100,30 @@ class DownloadOverlay(
     private var adaptPanel: ((Int, Int) -> Unit)? = null
     private var busy = false
     private val dark get() = snapshot["dark"] == true
-    private val foreground get() = if (dark) Color.rgb(242, 242, 247) else Color.rgb(28, 28, 30)
-    private val muted get() = if (dark) Color.rgb(174, 174, 178) else Color.rgb(108, 108, 112)
-    private val background get() = if (dark) Color.rgb(28, 28, 30) else Color.rgb(242, 242, 247)
-    private val surface get() = if (dark) Color.rgb(44, 44, 46) else Color.WHITE
-    private val accent get() = if (dark) Color.rgb(100, 181, 255) else Color.rgb(0, 104, 224)
-    private val primary get() = Color.rgb(0, 112, 238)
+    private val appearance get() = snapshot["appearance"] as? Map<*, *>
+    private fun themeColor(key: String, fallback: Int): Int {
+        val value = (appearance?.get(key) as? Number)?.toLong() ?: return fallback
+        return if (value in 0xFF000000L..0xFFFFFFFFL) value.toInt() else fallback
+    }
+    private val foreground get() = themeColor("foreground", if (dark) Color.rgb(242, 242, 247) else Color.rgb(28, 28, 30))
+    private val muted get() = themeColor("muted", if (dark) Color.rgb(174, 174, 178) else Color.rgb(108, 108, 112))
+    private val background get() = themeColor("background", if (dark) Color.rgb(28, 28, 30) else Color.rgb(242, 242, 247))
+    private val surface get() = themeColor("surface", if (dark) Color.rgb(44, 44, 46) else Color.WHITE)
+    private val outline get() = themeColor("border", if (dark) Color.rgb(64, 64, 67) else Color.rgb(224, 225, 232))
+    private val accent get() = themeColor("accent", if (dark) Color.rgb(100, 181, 255) else Color.rgb(0, 104, 224))
+    private val onAccent get() = themeColor("onAccent", Color.WHITE)
+    private val uploadAccent get() = themeColor("companion", if (dark) Color.rgb(173, 165, 255) else Color.rgb(88, 86, 214))
+    private val ripple get() = Color.argb(if (dark) 36 else 24, Color.red(accent), Color.green(accent), Color.blue(accent))
+    private val panelSurface get() = when (appearance?.get("glassStyle")) {
+        "clear" -> (surface and 0x00FFFFFF) or 0xF5000000.toInt()
+        "frosted" -> (surface and 0x00FFFFFF) or 0xFC000000.toInt()
+        else -> surface
+    }
+    private val direction get() = snapshot["direction"] as? String ?: "download"
+    private val transferAccent get() = if (direction == "upload") uploadAccent else accent
+    private val primary get() = accent
     private val destructive get() = Color.rgb(217, 45, 32)
-    private val softAccent get() = if (dark) Color.rgb(32, 53, 76) else Color.rgb(229, 240, 255)
+    private val softAccent get() = themeColor("softAccent", if (dark) Color.rgb(32, 53, 76) else Color.rgb(229, 240, 255))
     private val success get() = if (dark) Color.rgb(48, 209, 88) else Color.rgb(36, 138, 61)
     private val failure get() = if (dark) Color.rgb(255, 159, 10) else Color.rgb(180, 83, 9)
 
@@ -118,6 +146,7 @@ class DownloadOverlay(
         }
         pendingPermission = false
         collapsed = false
+        bubbleDocked = false
         render()
         return state()
     }
@@ -128,7 +157,7 @@ class DownloadOverlay(
             if (permission()) {
                 try { render() } catch (error: Exception) { fail(error) }
             } else {
-                Toast.makeText(app, "未授予悬浮窗权限，可在下载管理中重新开启", Toast.LENGTH_LONG).show()
+                Toast.makeText(app, "未授予悬浮窗权限，可在传输管理中重新开启", Toast.LENGTH_LONG).show()
             }
             changed(state())
         } else if (visible && !permission()) close()
@@ -136,11 +165,12 @@ class DownloadOverlay(
 
     fun update(value: Map<*, *>) {
         val previousDark = dark
+        val previousAppearance = appearance
         snapshot = value
         if (!visible) return
         if (!permission()) { close(); return }
         try {
-            if (previousDark != dark) render() else bind()
+            if (previousDark != dark || previousAppearance != appearance) render() else bind()
         } catch (error: Exception) { fail(error) }
     }
 
@@ -148,18 +178,21 @@ class DownloadOverlay(
         pendingPermission = false
         saveBounds()
         removeView()
+        bubbleDocked = false
+        bubbleTouching = false
         if (subscribed) { app.unregisterComponentCallbacks(this); subscribed = false }
         changed(state())
     }
 
     private fun removeView() {
+        mainHandler.removeCallbacks(dockAfterIdle)
         root?.let { try { wm.removeViewImmediate(it) } catch (_: IllegalArgumentException) { } }
         root = null
         params = null
         summary = null
         percentage = null
-        transferSpeed = null
-        transferred = null
+        downloadSpeedLabel = null
+        uploadSpeedLabel = null
         overall = null
         rows = null
         bubble = null
@@ -203,19 +236,22 @@ class DownloadOverlay(
             gravity = Gravity.TOP or Gravity.LEFT
             x = bounds.x; y = bounds.y
             if (Build.VERSION.SDK_INT >= 28) layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_NEVER
-            title = "文析助手下载悬浮窗"
+            title = "文析助手传输悬浮窗"
         }
         wm.addView(view, layout)
         root = view
         params = layout
         if (!subscribed) { app.registerComponentCallbacks(this); subscribed = true }
         bind()
+        if (collapsed) {
+            if (bubbleDocked) move(bubbleBounds) else scheduleBubbleDock()
+        }
         changed(state())
     }
 
     private fun shape(radius: Int, color: Int = surface, bordered: Boolean = false) = GradientDrawable().apply {
         setColor(color); cornerRadius = dp(radius).toFloat()
-        if (bordered) setStroke(dp(1), if (dark) Color.rgb(64, 64, 67) else Color.rgb(224, 225, 232))
+        if (bordered) setStroke(dp(1), outline)
     }
 
     private fun text(label: String, size: Float = 13f) = TextView(context).apply {
@@ -230,7 +266,7 @@ class DownloadOverlay(
         isClickable = true; isFocusable = true
         minWidth = dp(44); minHeight = dp(44)
         typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
-        background = RippleDrawable(ColorStateList.valueOf(if (dark) 0x33FFFFFF else 0x18007AFF), shape(14, softAccent), null)
+        background = RippleDrawable(ColorStateList.valueOf(ripple), shape(14, softAccent), null)
         setTextColor(accent)
         setOnClickListener { try { action() } catch (error: Exception) { fail(error) } }
     }
@@ -245,75 +281,91 @@ class DownloadOverlay(
 
     private fun panel(): View {
         val frame = FrameLayout(context).apply {
-            background = shape(28, this@DownloadOverlay.background, bordered = true); clipToOutline = true
+            background = shape(24, panelSurface, bordered = true); clipToOutline = true
             elevation = dp(8).toFloat()
         }
-        val column = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(12), dp(6), dp(12), dp(14)) }
+        val column = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL; setPadding(dp(12), dp(6), dp(12), dp(14))
+        }
         frame.addView(column, FrameLayout.LayoutParams(-1, -1))
-        val grip = FrameLayout(context).apply { contentDescription = "拖动移动下载悬浮窗" }
+        val grip = FrameLayout(context).apply { contentDescription = "拖动移动传输悬浮窗" }
         grip.addView(View(context).apply { background = shape(2, if (dark) 0xFF636366.toInt() else 0xFFC7C7CC.toInt()) },
-            FrameLayout.LayoutParams(dp(32), dp(4), Gravity.TOP or Gravity.CENTER_HORIZONTAL))
+            FrameLayout.LayoutParams(dp(28), dp(3), Gravity.TOP or Gravity.CENTER_HORIZONTAL))
         drag(grip)
         column.addView(grip, LinearLayout.LayoutParams(-1, dp(6)))
-        val title = text("下载管理", 15f).apply {
+        val title = text("传输管理", 14f).apply {
             tag = "download-overlay-title"
             typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
-            gravity = Gravity.CENTER
-            contentDescription = "打开下载管理"
+            gravity = Gravity.CENTER; includeFontPadding = false
+            contentDescription = "打开传输管理"
             isFocusable = true
-            setOnClickListener { try { send("openDownloads") } catch (error: Exception) { fail(error) } }
+            setOnClickListener {
+                try { send(if (direction == "upload" || number("uploadActive") > 0 && number("downloadActive") == 0L) "openUploads" else "openDownloads") }
+                catch (error: Exception) { fail(error) }
+            }
         }
         drag(title)
-        column.addView(title, LinearLayout.LayoutParams(-1, dp(32)))
+        column.addView(title, LinearLayout.LayoutParams(-1, dp(28)))
         val overview = LinearLayout(context).apply {
-            orientation = LinearLayout.VERTICAL; background = shape(16)
-            setPadding(dp(10), dp(7), dp(10), dp(7))
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(2), dp(6), dp(2), dp(6))
         }
         val metrics = LinearLayout(context).apply { gravity = Gravity.CENTER_VERTICAL }
-        summary = text("", 12f).also { metrics.addView(it, LinearLayout.LayoutParams(0, -2, 1f)) }
-        percentage = text("", 18f).apply {
+        summary = text("", 11f).apply { setTextColor(muted); includeFontPadding = false }.also {
+            metrics.addView(it, LinearLayout.LayoutParams(0, -2, 1f))
+        }
+        percentage = text("", 16f).apply {
+            includeFontPadding = false
             typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
         }.also { metrics.addView(it, LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dp(6) }) }
         overview.addView(metrics, LinearLayout.LayoutParams(-1, -2))
-        val amounts = LinearLayout(context).apply { gravity = Gravity.CENTER_VERTICAL }
-        transferSpeed = text("", 11f).apply { setTextColor(accent) }.also { amounts.addView(it, LinearLayout.LayoutParams(0, -2, 1f)) }
-        transferred = text("", 10f).apply { setTextColor(muted); gravity = Gravity.RIGHT or Gravity.CENTER_VERTICAL }.also {
-            amounts.addView(it, LinearLayout.LayoutParams(0, -2, 1.6f))
-        }
-        overview.addView(amounts, LinearLayout.LayoutParams(-1, -2))
+        val speeds = LinearLayout(context).apply { gravity = Gravity.CENTER_VERTICAL }
+        downloadSpeedLabel = text("", 11f).apply {
+            includeFontPadding = false; setTextColor(accent)
+            contentDescription = "查看下载任务"; isFocusable = true
+            setOnClickListener { send("openDownloads") }
+        }.also { speeds.addView(it, LinearLayout.LayoutParams(0, -2, 1f)) }
+        uploadSpeedLabel = text("", 11f).apply {
+            includeFontPadding = false; setTextColor(uploadAccent)
+            contentDescription = "查看上传任务"; isFocusable = true
+            gravity = Gravity.RIGHT or Gravity.CENTER_VERTICAL
+            setOnClickListener { send("openUploads") }
+        }.also { speeds.addView(it, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(8) }) }
+        overview.addView(speeds, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(5) })
         overall = bar().also { overview.addView(it, LinearLayout.LayoutParams(-1, dp(3)).apply { topMargin = dp(5) }) }
-        column.addView(overview, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4); bottomMargin = dp(6) })
+        column.addView(overview, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(2); bottomMargin = dp(4) })
         val scroll = ScrollView(context).apply {
             tag = "download-task-list"
             isFillViewport = false; isVerticalScrollBarEnabled = true
+            clipToPadding = true
         }
         rows = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
         scroll.addView(rows, FrameLayout.LayoutParams(-1, -2))
         column.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
         val footer = LinearLayout(context).apply { gravity = Gravity.CENTER_VERTICAL }
-        val collapse = button("收起为悬浮球") { collapsed = true; render() }.apply {
-            textSize = 12f; minHeight = dp(36); setTextColor(Color.WHITE)
-            background = RippleDrawable(ColorStateList.valueOf(0x33FFFFFF), shape(18, primary), null)
+        val collapse = button("收起为悬浮球") { collapseToBubble() }.apply {
+            textSize = 12f; minHeight = dp(36); setTextColor(onAccent)
+            background = RippleDrawable(ColorStateList.valueOf(0x33FFFFFF), shape(12, primary), null)
             setPadding(dp(10), 0, dp(10), 0)
-            setCompoundDrawablesRelative(Glyph("collapse", Color.WHITE).apply { setBounds(0, 0, dp(18), dp(18)) }, null, null, null)
+            setCompoundDrawablesRelative(Glyph("collapse", onAccent).apply { setBounds(0, 0, dp(18), dp(18)) }, null, null, null)
             compoundDrawablePadding = dp(4)
         }
         footer.addView(collapse, LinearLayout.LayoutParams(-2, dp(36)))
         footer.addView(View(context), LinearLayout.LayoutParams(0, 1, 1f))
-        footer.addView(button("关闭", "关闭悬浮窗，继续下载") { close() }.apply {
+        footer.addView(button("关闭", "关闭悬浮窗，继续传输") { close() }.apply {
             textSize = 12f; minHeight = dp(36); setTextColor(Color.WHITE)
-            background = RippleDrawable(ColorStateList.valueOf(0x33FFFFFF), shape(18, destructive), null)
+            background = RippleDrawable(ColorStateList.valueOf(0x33FFFFFF), shape(12, destructive), null)
             setPadding(dp(10), 0, dp(10), 0)
         }, LinearLayout.LayoutParams(-2, dp(36)).apply { leftMargin = dp(4) })
         val handle = button("", "拖动调整小窗大小") { }.apply {
             minWidth = dp(32); minHeight = dp(32)
-            background = RippleDrawable(ColorStateList.valueOf(0x18007AFF), shape(10), null)
+            background = RippleDrawable(ColorStateList.valueOf(ripple), shape(10, this@DownloadOverlay.background), null)
             setCompoundDrawables(Glyph("resize", muted).apply { setBounds(0, 0, dp(18), dp(18)) }, null, null, null)
             setPadding(dp(7), dp(7), dp(7), dp(7))
         }
         drag(handle, DragOperation.RESIZE)
         footer.addView(handle, LinearLayout.LayoutParams(dp(32), dp(32)).apply { leftMargin = dp(4) })
-        column.addView(footer, LinearLayout.LayoutParams(-1, dp(36)).apply { topMargin = dp(4) })
+        column.addView(footer, LinearLayout.LayoutParams(-1, dp(36)).apply { topMargin = dp(6) })
 
         val widthHandle = FrameLayout(context).apply {
             contentDescription = "左右拖动调整小窗宽度"
@@ -338,11 +390,11 @@ class DownloadOverlay(
             if (previousCompact != compact) {
                 previousCompact = compact
                 compactPanel = compact
-                amounts.visibility = if (compact) View.GONE else View.VISIBLE
+                speeds.visibility = if (compact) View.GONE else View.VISIBLE
                 overall?.visibility = if (compact) View.GONE else View.VISIBLE
-                overview.setPadding(dp(10), dp(if (compact) 3 else 7), dp(10), dp(if (compact) 3 else 7))
-                title.layoutParams = title.layoutParams.apply { this.height = dp(if (compact) 28 else 32) }
-                percentage?.textSize = if (compact) 14f else 18f
+                overview.setPadding(dp(2), dp(if (compact) 3 else 6), dp(2), dp(if (compact) 3 else 6))
+                title.layoutParams = title.layoutParams.apply { this.height = dp(if (compact) 26 else 28) }
+                percentage?.textSize = if (compact) 14f else 16f
                 taskRows.values.forEach { it.compact(compact) }
             }
             if (previousNarrow != narrow) {
@@ -372,6 +424,13 @@ class DownloadOverlay(
                 paint.style = Paint.Style.FILL
                 canvas.drawCircle(19f, 19f, 4f, paint)
                 paint.style = Paint.Style.STROKE
+            } else if (kind == "up" || kind == "down") {
+                val start = if (kind == "up") 18f else 6f
+                val end = if (kind == "up") 6f else 18f
+                val wing = if (kind == "up") 11f else 13f
+                canvas.drawLine(12f, start, 12f, end, paint)
+                canvas.drawLine(7f, wing, 12f, end, paint)
+                canvas.drawLine(17f, wing, 12f, end, paint)
             } else {
                 canvas.drawLine(5f, 18f, 18f, 5f, paint)
                 canvas.drawLine(11f, 18f, 18f, 11f, paint)
@@ -386,23 +445,68 @@ class DownloadOverlay(
 
     private fun ball(): View = ProgressBall(context).also {
         bubble = it
-        it.setOnClickListener { try { collapsed = false; render() } catch (error: Exception) { fail(error) } }
+        it.setOnClickListener {
+            try { collapsed = false; bubbleDocked = false; bubbleTouching = false; render() }
+            catch (error: Exception) { fail(error) }
+        }
         drag(it)
+    }
+
+    private fun collapseToBubble() {
+        collapsed = true
+        bubbleDocked = false
+        bubbleTouching = false
+        lastBubbleInteraction = SystemClock.uptimeMillis()
+        render()
+    }
+
+    private fun visibleBubbleBounds(): OverlayBounds {
+        if (!bubbleDocked) return bubbleBounds
+        val (width, _) = screen()
+        val visibleWidth = dp(24)
+        return bubbleBounds.copy(x = if (bubbleDockedRight) width - visibleWidth else 0, width = visibleWidth)
+    }
+
+    private fun scheduleBubbleDock() {
+        mainHandler.removeCallbacks(dockAfterIdle)
+        if (!visible || !collapsed || bubbleTouching || bubbleDocked) return
+        mainHandler.postDelayed(dockAfterIdle, (lastBubbleInteraction + 3000L - SystemClock.uptimeMillis()).coerceAtLeast(0L))
+    }
+
+    private fun dockBubble() {
+        if (!visible || !collapsed || bubbleTouching || bubbleDocked) return
+        val (width, _) = screen()
+        bubbleDockedRight = bubbleBounds.x + bubbleBounds.width / 2 >= width / 2
+        bubbleDocked = true
+        move(bubbleBounds)
+        bubble?.refresh()
+        saveBounds()
+    }
+
+    private fun wakeBubble() {
+        mainHandler.removeCallbacks(dockAfterIdle)
+        bubbleTouching = true
+        if (bubbleDocked) {
+            bubbleDocked = false
+            move(bubbleBounds)
+            bubble?.refresh()
+        }
     }
 
     private fun bind() {
         if (collapsed) { bubble?.refresh(); return }
         val status = snapshot["status"] as? String ?: "暂无任务"
-        val speed = bytes(number("speed")) + "/s"
+        val downSpeed = if (snapshot.containsKey("downloadSpeed")) number("downloadSpeed") else if (direction != "upload") number("speed") else 0L
+        val upSpeed = if (snapshot.containsKey("uploadSpeed")) number("uploadSpeed") else if (direction == "upload") number("speed") else 0L
         val percent = (snapshot["progress"] as? Number)?.toInt() ?: -1
         val complete = number("count") > 0 && number("completed") == number("count")
-        val tint = if (complete) success else if (number("active") == 0L && number("failed") > 0) failure else accent
+        val tint = if (complete) success else if (number("active") == 0L && number("failed") > 0) failure else transferAccent
         summary?.text = "$status · ${number("count")} 项"
         percentage?.text = if (percent >= 0) "$percent%" else "—"
         percentage?.setTextColor(tint)
-        transferSpeed?.text = if (number("active") > 0) speed else "${number("completed")}/${number("count")} 已完成"
-        transferSpeed?.setTextColor(tint)
-        transferred?.text = if (number("total") > 0) "${bytes(number("downloaded"))} / ${bytes(number("total"))}" else "已下载 ${bytes(number("downloaded"))}"
+        downloadSpeedLabel?.text = "↓ ${bytes(downSpeed)}/s"
+        uploadSpeedLabel?.text = "↑ ${bytes(upSpeed)}/s"
+        summary?.contentDescription = "$status，${number("count")} 项，已传输 ${bytes(number("downloaded"))}，总计 ${bytes(number("total"))}"
         overall?.isIndeterminate = percent < 0 && number("active") > 0
         overall?.progress = percent.coerceIn(0, 100)
         overall?.progressTintList = ColorStateList.valueOf(tint)
@@ -414,74 +518,108 @@ class DownloadOverlay(
             for ((index, entry) in data.withIndex()) {
                 val row = TaskRow()
                 taskRows[ids[index]] = row
-                rows?.addView(row.view, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(5) })
+                rows?.addView(row.view, LinearLayout.LayoutParams(-1, -2))
             }
-            if (data.isEmpty()) rows?.addView(text("添加下载任务后，即可在这里查看进度", 12f).apply {
+            if (data.isEmpty()) rows?.addView(text("添加上传或下载任务后，即可在这里查看进度", 12f).apply {
                 setTextColor(muted); maxLines = 2; gravity = Gravity.CENTER
                 background = shape(16); setPadding(dp(12), dp(12), dp(12), dp(12))
             }, LinearLayout.LayoutParams(-1, -2))
-            if (number("count") > data.size) rows?.addView(text("更多任务请打开下载列表查看", 11f).apply { setTextColor(muted) })
+            if (number("count") > data.size) rows?.addView(text("更多任务请打开传输管理查看", 11f).apply { setTextColor(muted) })
         }
         for (entry in data) taskRows[entry["id"]]?.bind(entry)
     }
 
     private inner class TaskRow {
+        private var uploading = false
+        private var completed = false
+        private var boundTint: Int? = null
+        private var boundDirection: Boolean? = null
         val view = LinearLayout(context).apply {
-            tag = "download-task-row"
-            gravity = Gravity.CENTER_VERTICAL; background = shape(14)
-            setPadding(dp(10), dp(5), dp(8), dp(5))
+            tag = "download-task-row"; orientation = LinearLayout.VERTICAL
+            isClickable = true; isFocusable = true
+            background = RippleDrawable(ColorStateList.valueOf(ripple), null, shape(0))
+            setOnClickListener { send(if (uploading) "openUploads" else "openDownloads") }
         }
-        private val title = text("", 13f).apply { typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL) }
-        private val info = text("", 10f).apply { setTextColor(muted) }
-        private val status = text("", 10f).apply { setTextColor(muted) }
-        private val speedLabel = text("", 10f).apply { setTextColor(accent); gravity = Gravity.RIGHT or Gravity.CENTER_VERTICAL }
+        private val main = LinearLayout(context).apply { gravity = Gravity.CENTER_VERTICAL }
+        private val directionIcon = View(context)
+        private val title = text("", 13f).apply {
+            includeFontPadding = false; typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        }
+        private val info = text("", 10f).apply { includeFontPadding = false; setTextColor(muted) }
+        private val speedLabel = text("", 10f).apply {
+            includeFontPadding = false; gravity = Gravity.RIGHT or Gravity.CENTER_VERTICAL
+        }
         private val progress = bar()
         private var action = ""
         private var id = ""
-        private val control = button("", "操作下载任务") { if (action.isNotEmpty()) send(action, id) }
+        private val control = button("", "操作传输任务") { if (action.isNotEmpty()) send(action, id) }.apply {
+            minWidth = dp(32); minHeight = dp(32); textSize = 10f
+            setPadding(0, 0, 0, 0)
+        }
         init {
+            main.addView(directionIcon, LinearLayout.LayoutParams(dp(24), dp(24)).apply { rightMargin = dp(8) })
             val labels = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
-            labels.addView(title); labels.addView(info)
-            val details = LinearLayout(context)
-            details.addView(status, LinearLayout.LayoutParams(0, -2, 1f))
-            details.addView(speedLabel, LinearLayout.LayoutParams(-2, -2))
-            labels.addView(details, LinearLayout.LayoutParams(-1, -2))
-            labels.addView(progress, LinearLayout.LayoutParams(-1, dp(3)).apply { topMargin = dp(4) })
-            view.addView(labels, LinearLayout.LayoutParams(0, -2, 1f))
-            view.addView(control, LinearLayout.LayoutParams(dp(44), dp(44)).apply { leftMargin = dp(8) })
+            labels.addView(title, LinearLayout.LayoutParams(-1, -2))
+            val details = LinearLayout(context).apply { gravity = Gravity.CENTER_VERTICAL }
+            details.addView(info, LinearLayout.LayoutParams(0, -2, 1f))
+            details.addView(speedLabel, LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dp(4) })
+            labels.addView(details, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(1) })
+            labels.addView(progress, LinearLayout.LayoutParams(-1, dp(2)).apply { topMargin = dp(3) })
+            main.addView(labels, LinearLayout.LayoutParams(0, -2, 1f))
+            main.addView(control, LinearLayout.LayoutParams(dp(32), dp(32)).apply { leftMargin = dp(8) })
+            view.addView(main, LinearLayout.LayoutParams(-1, -2))
+            view.addView(View(context).apply { setBackgroundColor(if (dark) 0xFF3A3A3C.toInt() else 0xFFEEEEF2.toInt()) },
+                LinearLayout.LayoutParams(-1, dp(1)).apply { leftMargin = dp(34) })
             compact(compactPanel)
         }
         fun compact(value: Boolean) {
-            info.visibility = if (value) View.GONE else View.VISIBLE
-            control.minHeight = dp(if (value) 32 else 44)
-            control.layoutParams = control.layoutParams.apply { height = dp(if (value) 32 else 44) }
+            main.setPadding(dp(2), dp(if (value) 2 else 3), dp(2), dp(if (value) 2 else 3))
+            progress.visibility = if (value || completed) View.GONE else View.VISIBLE
         }
         fun bind(data: Map<*, *>) {
-            id = data["id"] as? String ?: ""
+            id = data["taskId"] as? String ?: data["id"] as? String ?: ""
             action = data["action"] as? String ?: ""
-            title.text = data["name"] as? String ?: "下载任务"
+            uploading = data["direction"] == "upload"
+            completed = data["status"] == "completed"
+            val failed = data["status"] == "failed" || data["status"] == "interrupted"
+            val tint = if (completed) success else if (failed) failure else if (uploading) uploadAccent else accent
+            title.text = data["name"] as? String ?: "传输任务"
+            if (boundTint != tint || boundDirection != uploading) {
+                val softTint = Color.argb(if (dark) 36 else 20, Color.red(tint), Color.green(tint), Color.blue(tint))
+                directionIcon.background = shape(8, softTint)
+                directionIcon.foreground = Glyph(if (uploading) "up" else "down", tint)
+                control.setTextColor(tint)
+                control.background = RippleDrawable(ColorStateList.valueOf(ripple), shape(10, softTint), null)
+                boundTint = tint; boundDirection = uploading
+            }
+            directionIcon.contentDescription = if (uploading) "上传" else "下载"
             val received = (data["downloaded"] as? Number)?.toLong() ?: 0
             val total = (data["total"] as? Number)?.toLong() ?: 0
             val speed = (data["speed"] as? Number)?.toLong() ?: 0
             val value = (data["progress"] as? Number)?.toInt() ?: -1
-            info.text = "${bytes(received)}${if (total > 0) " / ${bytes(total)}" else ""}${if (value >= 0) " · $value%" else ""}"
-            status.text = "${data["label"] ?: ""}"
-            status.setTextColor(if (data["status"] == "failed") failure else muted)
+            val label = data["label"] as? String ?: ""
+            info.text = "$label · ${if (completed) bytes(total) else if (value >= 0) "$value%" else bytes(received)}"
+            info.setTextColor(if (failed) failure else muted)
             speedLabel.text = if (speed > 0) "${bytes(speed)}/s" else ""
-            progress.isIndeterminate = value < 0 && action == "pause"
+            speedLabel.setTextColor(tint)
+            progress.isIndeterminate = value < 0 && speed > 0 && data["status"] == "running"
             progress.progress = value.coerceIn(0, 100)
-            progress.progressTintList = ColorStateList.valueOf(if (data["status"] == "completed") success else accent)
-            control.text = if (action == "pause") "暂停" else "继续"
+            progress.progressTintList = ColorStateList.valueOf(tint)
+            progress.indeterminateTintList = ColorStateList.valueOf(tint)
+            control.text = data["actionLabel"] as? String ?: if (action == "pause") "暂停" else "继续"
             control.contentDescription = "${control.text} ${title.text}"
             control.isEnabled = !busy && action.isNotEmpty()
             control.visibility = if (action.isNotEmpty()) View.VISIBLE else View.GONE
+            view.contentDescription = "${if (uploading) "上传" else "下载"} ${title.text}，$label，${if (value >= 0) "$value%，" else ""}${bytes(received)} / ${bytes(total)}"
+            compact(compactPanel)
         }
     }
 
     private fun send(action: String, id: String? = null) {
         if (busy) return
-        if (action == "openDownloads") {
-            try { app.startActivity(Intent(app, MainActivity::class.java).setAction(OPEN_DOWNLOADS)
+        if (action == "openDownloads" || action == "openUploads") {
+            try { app.startActivity(Intent(app, MainActivity::class.java).setAction("com.asterlink.app.OPEN_TRANSFERS")
+                .putExtra("transferTab", if (action == "openUploads") "uploads" else "downloads")
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)) }
             catch (error: Exception) { report("download.overlay_open_failed", error) }
         }
@@ -489,7 +627,7 @@ class DownloadOverlay(
         command(action, id) { success ->
             busy = false
             if (visible) bind()
-            if (!success) Toast.makeText(app, "操作未完成，请打开下载管理查看", Toast.LENGTH_SHORT).show()
+            if (!success) Toast.makeText(app, "操作未完成，请打开传输管理查看", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -504,6 +642,7 @@ class DownloadOverlay(
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     downX = event.rawX; downY = event.rawY; moved = false
+                    if (collapsed) wakeBubble()
                     initial = if (collapsed) bubbleBounds else panelBounds
                     true
                 }
@@ -525,6 +664,11 @@ class DownloadOverlay(
                     }
                     saveBounds()
                     if (!moved && event.actionMasked == MotionEvent.ACTION_UP) target.performClick()
+                    if (collapsed) {
+                        bubbleTouching = false
+                        lastBubbleInteraction = SystemClock.uptimeMillis()
+                        scheduleBubbleDock()
+                    }
                     true
                 }
                 else -> false
@@ -535,12 +679,17 @@ class DownloadOverlay(
     private fun move(bounds: OverlayBounds) {
         val layout = params ?: return
         val view = root ?: return
-        val safe = fitted(bounds)
+        var safe = fitted(bounds)
+        if (collapsed && bubbleDocked) {
+            val (width, _) = screen()
+            safe = safe.copy(x = if (bubbleDockedRight) width - safe.width else 0)
+        }
         if (collapsed) bubbleBounds = safe else {
             panelBounds = safe
             adaptPanel?.invoke(safe.width, safe.height)
         }
-        layout.x = safe.x; layout.y = safe.y; layout.width = safe.width; layout.height = safe.height
+        val displayed = if (collapsed) visibleBubbleBounds() else safe
+        layout.x = displayed.x; layout.y = displayed.y; layout.width = displayed.width; layout.height = displayed.height
         try { wm.updateViewLayout(view, layout) } catch (error: Exception) { fail(error) }
     }
 
@@ -568,38 +717,129 @@ class DownloadOverlay(
 
     private inner class ProgressBall(context: Context) : View(context) {
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private var animator: ValueAnimator? = null
+        private var displayedProgress = 0f
+        private var targetProgress = -1
+        private var completed = false
+        private var completionFeedback = 0f
+        private var initialized = false
+        private var runId = ""
+        private fun canAnimate(): Boolean = isAttachedToWindow && isShown &&
+            (context.getSystemService(Context.POWER_SERVICE) as PowerManager).isInteractive &&
+            if (Build.VERSION.SDK_INT >= 26) ValueAnimator.areAnimatorsEnabled()
+            else Settings.Global.getFloat(context.contentResolver, Settings.Global.ANIMATOR_DURATION_SCALE, 1f) > 0f
         init { isClickable = true; isFocusable = true; importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_YES }
         fun refresh() {
-            contentDescription = "下载${snapshot["status"] ?: ""}，${number("progress").takeIf { it >= 0 }?.let { "$it%" } ?: "大小未知"}，点击展开下载管理"
+            val speeds = if (direction == "mixed") "，下载 ${bytes(number("downloadSpeed"))}/s，上传 ${bytes(number("uploadSpeed"))}/s" else ""
+            contentDescription = "传输进度，${snapshot["status"] ?: ""}，${number("progress").takeIf { it >= 0 }?.let { "$it%" } ?: "大小未知"}$speeds，${if (bubbleDocked) "已贴边隐藏，" else ""}点击展开传输管理"
+            val next = ((snapshot["progress"] as? Number)?.toInt() ?: -1).coerceIn(-1, 100)
+            val done = number("count") > 0 && number("completed") == number("count")
+            val nextRun = snapshot["runId"] as? String ?: ""
+            val finish = initialized && !completed && done && runId == nextRun
+            val animate = canAnimate() && (done || number("active") > 0 && number("speed") > 0)
+            if (!animate) stopAnimation()
+            if (next != targetProgress || done != completed || runId != nextRun) {
+                animator?.cancel()
+                val initialProgress = displayedProgress
+                completionFeedback = 0f
+                if (initialized && next >= 0 && targetProgress >= 0 && next >= targetProgress &&
+                    runId == nextRun && animate) {
+                    animator = ValueAnimator.ofFloat(0f, 1f).apply {
+                        duration = if (finish) 900L else 260L
+                        interpolator = DecelerateInterpolator()
+                        addUpdateListener {
+                            val t = it.animatedValue as Float
+                            displayedProgress = initialProgress + (next - initialProgress) * (t * if (finish) 3f else 1f).coerceAtMost(1f)
+                            completionFeedback = if (finish) kotlin.math.sin(Math.PI * t).toFloat() else 0f
+                            invalidate()
+                        }
+                        start()
+                    }
+                } else displayedProgress = next.coerceAtLeast(0).toFloat()
+                targetProgress = next
+                completed = done
+                runId = nextRun
+                initialized = true
+            }
             invalidate()
+        }
+        private fun stopAnimation() {
+            animator?.cancel(); animator = null
+            completionFeedback = 0f
+            displayedProgress = targetProgress.coerceAtLeast(0).toFloat()
+        }
+        override fun onDetachedFromWindow() {
+            stopAnimation()
+            super.onDetachedFromWindow()
+        }
+        override fun onWindowVisibilityChanged(visibility: Int) {
+            super.onWindowVisibilityChanged(visibility)
+            if (visibility != VISIBLE) {
+                stopAnimation()
+            }
         }
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
-            val cx = width / 2f; val cy = height / 2f
-            val outerRadius = min(width, height) / 2f - dp(3)
+            val fullWidth = if (bubbleDocked) dp(76) else width
+            val cx = if (bubbleDocked && !bubbleDockedRight) width - fullWidth / 2f else fullWidth / 2f
+            val cy = height / 2f
+            val outerRadius = min(fullWidth, height) / 2f - dp(3)
             val radius = outerRadius - dp(5)
             paint.style = Paint.Style.FILL; paint.color = surface
             canvas.drawCircle(cx, cy, outerRadius, paint)
             paint.style = Paint.Style.STROKE; paint.strokeWidth = dp(1).toFloat()
-            paint.color = if (dark) Color.rgb(64, 64, 67) else Color.rgb(224, 225, 232)
+            paint.color = outline
             canvas.drawCircle(cx, cy, outerRadius, paint)
             paint.strokeWidth = dp(3).toFloat()
             paint.color = if (dark) Color.rgb(64, 64, 67) else Color.rgb(233, 233, 240)
             canvas.drawCircle(cx, cy, radius, paint)
             val percent = (snapshot["progress"] as? Number)?.toInt() ?: -1
             val complete = number("count") > 0 && number("completed") == number("count")
-            val tint = if (complete) success else if (number("active") == 0L && number("failed") > 0) failure else accent
+            val tint = if (complete) success else if (number("active") == 0L) {
+                if (number("failed") > 0) failure else muted
+            } else transferAccent
             paint.color = tint; paint.strokeCap = Paint.Cap.ROUND
             val arc = RectF(cx - radius, cy - radius, cx + radius, cy + radius)
-            canvas.drawArc(arc, -90f, if (percent < 0) 80f else percent.coerceIn(0, 100) * 3.6f, false, paint)
+            if (percent >= 0) canvas.drawArc(arc, -90f, displayedProgress * 3.6f, false, paint)
             paint.style = Paint.Style.FILL; paint.textAlign = Paint.Align.CENTER
             paint.typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL); paint.textSize = dp(18).toFloat(); paint.color = tint
-            canvas.drawText(if (percent >= 0) "$percent%" else "↓", cx, cy + dp(1), paint)
+            if (bubbleDocked) {
+                val caption = if (percent >= 0) "$percent%" else if (direction == "upload") "↑" else "↓"
+                paint.textSize = dp(10).toFloat()
+                val available = (width - dp(4)).coerceAtLeast(1)
+                val measured = paint.measureText(caption)
+                if (measured > available) paint.textSize *= available / measured
+                canvas.drawText(caption, width / 2f, cy + dp(4), paint)
+                return
+            }
+            val mixed = direction == "mixed" && number("active") > 0
+            canvas.drawText(if (percent >= 0) "$percent%" else if (direction == "upload") "↑" else if (mixed) "↕" else "↓", cx, cy + dp(if (mixed) -7 else 1), paint)
+            if (completionFeedback > 0f) {
+                val x = cx + radius * .7f; val y = cy - radius * .65f
+                paint.color = surface; paint.alpha = (completionFeedback * 255).toInt()
+                canvas.drawCircle(x, y, dp(9).toFloat(), paint)
+                paint.color = success; paint.alpha = (completionFeedback * 255).toInt()
+                paint.style = Paint.Style.STROKE; paint.strokeWidth = dp(2).toFloat()
+                canvas.drawLine(x - dp(4), y, x - dp(1), y + dp(3), paint)
+                canvas.drawLine(x - dp(1), y + dp(3), x + dp(4), y - dp(3), paint)
+                paint.style = Paint.Style.FILL; paint.alpha = 255
+            }
             paint.typeface = Typeface.DEFAULT; paint.textSize = 9f * context.resources.displayMetrics.density; paint.color = muted
-            val label = if (number("active") > 0) bytes(number("speed")) + "/s" else snapshot["status"] as? String ?: "暂无任务"
             val available = radius * 1.65f
-            if (paint.measureText(label) > available) paint.textSize *= available / paint.measureText(label)
-            canvas.drawText(label, cx, cy + dp(15), paint)
+            fun line(label: String, offset: Int, color: Int) {
+                paint.textSize = 9f * context.resources.displayMetrics.density
+                paint.color = color
+                if (paint.measureText(label) > available) paint.textSize *= available / paint.measureText(label)
+                canvas.drawText(label, cx, cy + dp(offset), paint)
+            }
+            if (mixed) {
+                line("↓ ${bytes(number("downloadSpeed"))}/s", 7, accent)
+                line("↑ ${bytes(number("uploadSpeed"))}/s", 20, uploadAccent)
+            } else {
+                val label = if (number("active") > 0) "${if (direction == "upload") "↑" else "↓"} ${bytes(number("speed"))}/s"
+                    else snapshot["status"] as? String ?: "暂无任务"
+                line(label, 15, muted)
+            }
         }
         override fun performClick(): Boolean { super.performClick(); return true }
     }

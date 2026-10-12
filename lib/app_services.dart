@@ -9,15 +9,20 @@ import 'package:path_provider/path_provider.dart';
 import 'core/json.dart';
 import 'diagnostics/app_log.dart';
 import 'data/backup.dart';
+import 'data/backgrounds.dart';
+import 'domain/appearance.dart';
+import 'domain/background.dart';
 import 'data/cleanup_outbox.dart';
 import 'data/cloud_repository.dart';
 import 'data/cloud_favorites.dart';
 import 'data/http.dart';
 import 'data/remote_control_http.dart';
 import 'data/remote_control_service.dart';
+import 'data/announcement_service.dart';
 import 'data/app_update_service.dart';
 import 'data/github_update_service.dart';
 import 'data/providers/uc.dart';
+import 'data/providers/github.dart';
 import 'data/providers/baidu.dart';
 import 'data/providers/quark.dart';
 import 'data/providers/pan123.dart';
@@ -31,6 +36,11 @@ import 'domain/auth.dart';
 import 'domain/models.dart';
 import 'domain/settings.dart';
 import 'download/download_manager.dart';
+import 'download/transfer_activity.dart';
+import 'download/navigation_transfers.dart';
+import 'upload/upload_manager.dart';
+import 'lan/lan_service.dart';
+import 'lan/lan_files.dart';
 import 'download/download_shutdown.dart';
 import 'download/download_overlay.dart';
 import 'download/transfer_http.dart';
@@ -44,6 +54,7 @@ import 'data/providers/ilanzou.dart';
 import 'data/providers/lanzou.dart';
 import 'data/providers/ctfile.dart';
 import 'data/providers/feijipan.dart';
+import 'data/providers/pikpak.dart';
 import 'data/providers/weiyun.dart';
 import 'data/providers/wopan.dart';
 import 'data/providers/pan115.dart';
@@ -63,11 +74,20 @@ class AppServices extends ChangeNotifier {
     String controlUrl = RemoteControlService.buildUrl,
     bool controlEnabled = RemoteControlService.buildEnabled,
     RemoteControlFetcher? controlFetcher,
+    String announcementsUrl = AnnouncementService.buildUrl,
+    RemoteControlFetcher? announcementFetcher,
     GitHubUpdateService? githubUpdates,
     WindowsActions? windowsActions,
     RandomAccessFile? instanceLock,
+    LanService? lanService,
   }) : _instanceLock = instanceLock {
     vault = Vault(store);
+    announcements = AnnouncementService(
+      store,
+      url: announcementsUrl,
+      fetcher: announcementFetcher,
+      clock: clock,
+    );
     control = RemoteControlService(
       store,
       platform: Platform.operatingSystem,
@@ -96,6 +116,7 @@ class AppServices extends ChangeNotifier {
       cleanups.http,
       vault,
       cleanups,
+      clock: clock,
       checkAccess: control.checkCloud,
       preparationRetries: () => settings.retries,
       directShareDownloadEnabled: (platform, authenticated) {
@@ -115,11 +136,17 @@ class AppServices extends ChangeNotifier {
       (p, c) => cloud.connector(p).account(c),
       checkAccess: control.checkCloud,
       webAuthenticators: {
+        CloudPlatform.github:
+            (cloud.connector(CloudPlatform.github) as GitHubConnector)
+                .authenticate,
         CloudPlatform.baidu:
             (cloud.connector(CloudPlatform.baidu) as BaiduConnector)
                 .authenticate,
         CloudPlatform.ctfile:
             (cloud.connector(CloudPlatform.ctfile) as CtfileConnector)
+                .authenticate,
+        CloudPlatform.pikpak:
+            (cloud.connector(CloudPlatform.pikpak) as PikPakConnector)
                 .authenticate,
         CloudPlatform.feijipan:
             (cloud.connector(CloudPlatform.feijipan) as FeijipanConnector)
@@ -162,7 +189,11 @@ class AppServices extends ChangeNotifier {
       },
     );
     favorites = CloudFavorites(store, cloud);
-    backup = BackupRepository(store);
+    backgrounds = BackgroundRepository(
+      dataDirectory,
+      current: () => settings.background,
+    );
+    backup = BackupRepository(store, backgrounds: backgrounds);
     final engineGeneration = store.data.str('engineStorageGeneration');
     require(
       engineGeneration.isEmpty ||
@@ -182,6 +213,35 @@ class AppServices extends ChangeNotifier {
       cacheDirectory,
     );
     transfer = transferHttp ?? TransferHttp();
+    final backgroundTransfers =
+        platformFeatures && (Platform.isAndroid || Platform.isWindows);
+    lan =
+        lanService ??
+        LanService(
+          store: store,
+          files: LanFiles(android: platformFeatures && Platform.isAndroid),
+          foreground: backgroundTransfers
+              ? () => transferActivity.sync()
+              : null,
+        );
+    transferActivity = TransferActivity(
+      downloads: () => downloads.activity,
+      uploads: () => uploads.activity,
+      lan: () => lan.activity,
+      publish: (activity) async {
+        if (!backgroundTransfers) return;
+        try {
+          await nativeChannel.invokeMethod<void>('foreground', activity);
+        } on PlatformException catch (e) {
+          throw AppException(e.message ?? '后台传输服务启动失败');
+        }
+      },
+    );
+    uploads = UploadManager(
+      store: store,
+      cloud: cloud,
+      foreground: backgroundTransfers ? transferActivity.sync : null,
+    );
     downloads = DownloadManager(
       store: store,
       engine: engine,
@@ -191,18 +251,14 @@ class AppServices extends ChangeNotifier {
       refreshSource: cloud.refresh,
       checkNewCloudTask: control.checkCloud,
       onGuestDownload: requestGuestDownloadNotice,
-      foreground: platformFeatures && (Platform.isAndroid || Platform.isWindows)
-          ? (activity) async {
-              try {
-                await nativeChannel.invokeMethod<void>(
-                  'foreground',
-                  activity.toJson(),
-                );
-              } on PlatformException catch (e) {
-                throw AppException(e.message ?? '后台下载服务启动失败');
-              }
-            }
-          : null,
+      foreground: backgroundTransfers ? (_) => transferActivity.sync() : null,
+    );
+    navigationTransfers = NavigationTransfers(
+      changes: Listenable.merge([downloads, uploads]),
+      downloads: () => downloads.activeTasks,
+      uploads: () => uploads.activeTasks,
+      downloadById: downloads.task,
+      uploadById: uploads.task,
     );
     windows =
         windowsActions ??
@@ -222,16 +278,22 @@ class AppServices extends ChangeNotifier {
     );
     downloadShutdown = DownloadShutdown(
       supported: windows.supported,
-      changes: downloads,
+      changes: Listenable.merge([downloads, uploads, lan]),
       tasks: () => downloads.tasks,
-      busy: () => downloads.activeCount > 0,
+      busy: () =>
+          downloads.activeCount > 0 ||
+          uploads.activeCount > 0 ||
+          lan.activeConnections > 0,
       shutdown: windows.shutdown,
       flush: store.flush,
     );
     downloadOverlay = DownloadOverlay(
       supported: platformFeatures && Platform.isAndroid,
-      changes: Listenable.merge([downloads, store]),
+      changes: Listenable.merge([downloads, uploads, store]),
       tasks: () => downloads.tasks,
+      uploadTasks: () => uploads.tasks,
+      retryUpload: uploads.retry,
+      openUploads: requestUploadManager,
       pause: downloads.pause,
       resume: downloads.resume,
       pauseAll: downloads.pauseAll,
@@ -241,6 +303,8 @@ class AppServices extends ChangeNotifier {
           settings.theme == 'Dark' ||
           settings.theme == 'System' &&
               PlatformDispatcher.instance.platformBrightness == Brightness.dark,
+      appearance: (dark) =>
+          settings.themePalette.colors(dark).overlay(settings.glassStyle),
     );
     control.addListener(_controlChanged);
   }
@@ -252,6 +316,7 @@ class AppServices extends ChangeNotifier {
   final RandomAccessFile? _instanceLock;
   late final Vault vault;
   late final RemoteControlService control;
+  late final AnnouncementService announcements;
   final _enabledClouds = <CloudPlatform>{};
   late final ClipboardLinks clipboard;
   late final CleanupOutbox cleanups;
@@ -259,8 +324,14 @@ class AppServices extends ChangeNotifier {
   late final CloudFavorites favorites;
   late final AccountLoginService login;
   late final BackupRepository backup;
+  late final BackgroundRepository backgrounds;
   late final GopeedEngine engine;
   late final DownloadManager downloads;
+  late final UploadManager uploads;
+  late final LanService lan;
+  late final TransferActivity transferActivity;
+  late final NavigationTransfers navigationTransfers;
+  final transferTab = ValueNotifier<int>(0);
   late final AppUpdateService appUpdates;
   late final WindowsActions windows;
   late final DownloadShutdown downloadShutdown;
@@ -273,7 +344,17 @@ class AppServices extends ChangeNotifier {
   final accountNeedsLogin = <CloudPlatform>{};
   final sharedText = ValueNotifier<String?>(null);
   final downloadNavigation = ValueNotifier<int>(0);
+  final lanNavigation = ValueNotifier<int>(0);
   final guestDownloadNotice = ValueNotifier<bool>(false);
+
+  void refreshPublicDownloadPassword() {
+    if (!platformFeatures ||
+        _closed ||
+        !control.cloudEnabled(CloudPlatform.baidu)) {
+      return;
+    }
+    unawaited(cloud.publicPasswords.prefetch());
+  }
 
   void requestGuestDownloadNotice() {
     if (!_closed && !settings.hideGuestDownloadNotice) {
@@ -282,10 +363,32 @@ class AppServices extends ChangeNotifier {
   }
 
   void requestDownloadManager() {
-    if (!_closed) downloadNavigation.value++;
+    if (!_closed) {
+      transferTab.value = 0;
+      downloadNavigation.value++;
+    }
   }
 
-  final externalOpens = ExternalOpenInbox();
+  void requestUploadManager() {
+    if (!_closed) {
+      transferTab.value = 1;
+      downloadNavigation.value++;
+    }
+  }
+
+  void requestLanPage() {
+    if (!_closed) lanNavigation.value++;
+  }
+
+  Future<void> stopTransfers() async {
+    await lan.stop();
+    await uploads.stopAll();
+    await downloads.pauseAll();
+  }
+
+  final externalOpens = ExternalOpenInbox(
+    channel: Platform.isWindows ? windowsExternalOpenChannel : nativeChannel,
+  );
   String? migrationError;
   bool _closed = false;
   WebViewEnvironment? _webEnvironment;
@@ -338,7 +441,16 @@ class AppServices extends ChangeNotifier {
       throw const AppException('文析助手已在运行，请打开已有窗口');
     }
     try {
+      final startup = Stopwatch()..start();
+      DiagnosticLog.event('app.state_read_start');
       final store = await StateStore.open(data);
+      DiagnosticLog.event(
+        'app.state_read',
+        fields: {
+          'elapsedMs': startup.elapsedMilliseconds,
+          'tasks': (store.data['tasks'] as List? ?? []).length,
+        },
+      );
       final result = AppServices(
         store: store,
         dataDirectory: data,
@@ -348,6 +460,13 @@ class AppServices extends ChangeNotifier {
         instanceLock: lock,
       );
       await result.initialize();
+      DiagnosticLog.event(
+        'app.services_ready',
+        fields: {
+          'elapsedMs': startup.elapsedMilliseconds,
+          'tasks': result.downloads.tasks.length,
+        },
+      );
       return result;
     } catch (error, stack) {
       DiagnosticLog.error('app.initialize_failed', error, stack);
@@ -357,9 +476,29 @@ class AppServices extends ChangeNotifier {
   }
 
   Future<void> initialize() async {
+    if (platformFeatures && Platform.isWindows) {
+      windowsExternalOpenChannel.setMethodCallHandler((call) async {
+        if (call.method == 'externalOpenAvailable') {
+          await externalOpens.refresh();
+        }
+      });
+      await externalOpens.refresh();
+    }
     if (platformFeatures && Platform.isAndroid) {
       await importLegacy();
       nativeChannel.setMethodCallHandler((call) async {
+        if (call.method == 'openTransfers') {
+          final target = await nativeChannel.invokeMethod<String>(
+            'takeTransferNavigation',
+          );
+          if (target == 'lan') {
+            requestLanPage();
+          } else if (target == 'uploads') {
+            requestUploadManager();
+          } else if (target != null) {
+            requestDownloadManager();
+          }
+        }
         if (call.method == 'downloadOverlayState') {
           downloadOverlay.stateChanged(asJson(call.arguments));
         }
@@ -378,6 +517,8 @@ class AppServices extends ChangeNotifier {
         if (call.method == 'pauseAll' ||
             call.method == 'serviceTimeout' ||
             call.method == 'downloadServiceStalled') {
+          await lan.stop();
+          await uploads.stopAll(reason: '后台传输已停止，返回应用后可重新上传');
           await downloads.pauseAll(
             reason: switch (call.method) {
               'serviceTimeout' => '系统已暂停长时间后台下载，返回应用后可继续',
@@ -396,12 +537,23 @@ class AppServices extends ChangeNotifier {
       await externalOpens.refresh();
     }
     await vault.initializeAccounts();
+    await uploads.initialize();
     await downloads.initialize();
     if (platformFeatures && Platform.isAndroid) {
       final recoveryExpected = await nativeChannel.invokeMethod<bool>(
         'downloadsReady',
       );
       if (recoveryExpected != true) await downloads.discardInterrupted();
+      final target = await nativeChannel.invokeMethod<String>(
+        'takeTransferNavigation',
+      );
+      if (target == 'lan') {
+        requestLanPage();
+      } else if (target == 'uploads') {
+        requestUploadManager();
+      } else if (target != null) {
+        requestDownloadManager();
+      }
     }
     store.addListener(_changed);
     _changed();
@@ -565,10 +717,37 @@ class AppServices extends ChangeNotifier {
     await downloads.settingsChanged();
   }
 
+  Future<void> updateAppearance({
+    required String mode,
+    required AppPalette palette,
+    required GlassStyle glassStyle,
+    BackgroundSettings? background,
+  }) async {
+    await store.change((draft) {
+      require(['System', 'Light', 'Dark'].contains(mode), '外观模式无效');
+      draft['settings'] = AppSettings.fromJson(draft.obj('settings')).update({
+        'theme': mode,
+        'themePalette': palette.name,
+        'glassStyle': glassStyle.name,
+        if (background != null) 'background': background.toJson(),
+      }).toJson();
+    });
+    if (background != null) await backgrounds.collectUnused();
+  }
+
+  Future<int> updateDownloadDestination(
+    String? destination, {
+    bool includeUnfinished = false,
+  }) => downloads.changeDestination(
+    destination,
+    includeUnfinished: includeUnfinished,
+  );
+
   Future<void> updateBrowserDisplay(
     CloudPlatform platform, {
     String? view,
     String? sort,
+    bool? searchSubfolders,
   }) => store.change((draft) {
     require(view == null || ['list', 'grid'].contains(view), '显示方式无效');
     require(sort == null || ['name', 'size', 'date'].contains(sort), '排序方式无效');
@@ -577,6 +756,7 @@ class AppServices extends ChangeNotifier {
     final updated = BrowserDisplaySettings(
       view: view ?? previous.view,
       sort: sort ?? previous.sort,
+      searchSubfolders: searchSubfolders ?? previous.searchSubfolders,
       ascending: sort == null
           ? previous.ascending
           : sort == previous.sort
@@ -678,18 +858,28 @@ class AppServices extends ChangeNotifier {
   };
   Future<void> close() async {
     if (_closed) return;
+    await cloud.publicPasswords.close();
     downloadShutdown.close();
     await downloadOverlay.close();
     control.removeListener(_controlChanged);
     appUpdates.close();
     control.close();
     await control.flushCache();
+    await announcements.close();
+    navigationTransfers.dispose();
+    await lan.close();
+    await uploads.close();
     await downloads.close();
     cleanups.progress.close();
     _closed = true;
     clipboard.dispose();
     externalOpens.dispose();
+    if (platformFeatures && Platform.isWindows) {
+      windowsExternalOpenChannel.setMethodCallHandler(null);
+    }
     downloadNavigation.dispose();
+    lanNavigation.dispose();
+    transferTab.dispose();
     guestDownloadNotice.dispose();
     store.removeListener(_changed);
     await _webEnvironment?.dispose();

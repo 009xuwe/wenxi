@@ -31,8 +31,15 @@ class RequestScope {
     );
   }
 
-  Future<T> run<T>(Future<T> Function() action) =>
-      runZoned(action, zoneValues: {_zoneKey: this});
+  Future<T> run<T>(Future<T> Function() action, {bool inheritGuard = true}) =>
+      runZoned(
+        action,
+        zoneValues: {
+          _zoneKey: this,
+          // Shared, account-independent reads can own their cancellation scope.
+          if (!inheritGuard) _guardKey: null,
+        },
+      );
   void cancel() => token.cancel();
 
   static Future<T> cancellable<T>(Future<T> operation) async {

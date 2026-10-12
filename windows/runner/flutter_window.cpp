@@ -30,6 +30,10 @@ bool FlutterWindow::OnCreate() {
     return false;
   }
   RegisterPlugins(flutter_controller_->engine());
+  external_downloads_ = std::make_unique<ExternalDownloadBridge>(
+      flutter_controller_->engine()->messenger());
+  player_images_ = std::make_unique<PlayerImageBridge>(
+      flutter_controller_->engine()->messenger(), GetHandle());
   download_power_ = std::make_unique<DownloadPowerBridge>(
       flutter_controller_->engine()->messenger());
   theme_channel_ =
@@ -77,6 +81,8 @@ void FlutterWindow::OnDestroy() {
     theme_channel_.reset();
   }
   download_power_.reset();
+  external_downloads_.reset();
+  player_images_.reset();
   if (flutter_controller_) {
     flutter_controller_ = nullptr;
   }
@@ -88,6 +94,10 @@ LRESULT
 FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
                               WPARAM const wparam,
                               LPARAM const lparam) noexcept {
+  if (message == WM_COPYDATA) {
+    return external_downloads_ && external_downloads_->AcceptCopyData(
+        reinterpret_cast<const COPYDATASTRUCT*>(lparam));
+  }
   // Give Flutter, including plugins, an opportunity to handle window messages.
   if (flutter_controller_) {
     std::optional<LRESULT> result =

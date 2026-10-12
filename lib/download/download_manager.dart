@@ -10,6 +10,7 @@ import '../data/cleanup_outbox.dart';
 import '../data/http.dart';
 import '../data/state_store.dart';
 import '../domain/auth.dart';
+import '../domain/baidu_share_route.dart';
 import '../domain/downloads.dart';
 import '../domain/file_types.dart';
 import '../domain/models.dart';
@@ -24,12 +25,26 @@ import 'download_playback_cache.dart';
 import 'space_budget.dart';
 import 'transfer_http.dart';
 import 'baidu_transfer_recovery.dart';
+import 'aliyun_transfer_recovery.dart';
 
 class _Stopped implements Exception {}
 
 class _RecoverBaidu implements Exception {
   const _RecoverBaidu(this.action);
   final BaiduRecoveryAction action;
+}
+
+class _RecoverAliyun implements Exception {}
+
+bool _isAliyun(DownloadSpec spec) =>
+    spec.platform == CloudPlatform.aliyun || spec.profile == 'aliyun';
+
+String _aliyunAccountGroup(DownloadSpec spec) {
+  final session = asJson(spec.source?['session']);
+  final account = session.obj('metadata').str('accountId');
+  return account.isEmpty
+      ? ''
+      : sha256.convert(utf8.encode('aliyun:$account')).toString();
 }
 
 class _GuestDownloadBatch {
@@ -40,6 +55,9 @@ class _Run {
   _Run(this.clock);
   final Stopwatch clock;
   final baiduRecovery = BaiduTransferRecovery();
+  final aliyunRecovery = AliyunTransferRecovery();
+  int aliyunPolicyLimit = 0;
+  bool aliyunWaiting = false;
   final scope = RequestScope();
   final wake = Completer<void>();
   bool stopped = false;
@@ -138,6 +156,8 @@ class DownloadManager extends ChangeNotifier {
   List<DownloadTask> get tasks =>
       _tasks.values.toList()
         ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+  Iterable<DownloadTask> get activeTasks =>
+      _tasks.values.where((task) => task.active);
   int get activeCount => _running.length;
   AppSettings get settings => AppSettings.fromJson(store.data.obj('settings'));
   DownloadTask? task(String id) => _tasks[id];
@@ -229,15 +249,13 @@ class DownloadManager extends ChangeNotifier {
     }
     RandomAccessFile? handle;
     try {
-      final directory = engine.taskDirectory(id);
+      final directory = await engine.checkedTaskDirectory(id);
+      if (directory == null) return null;
       final path = p.join(directory.path, 'payload.gopeed');
       if (await FileSystemEntity.type(path, followLinks: false) !=
           FileSystemEntityType.file) {
         return null;
       }
-      final root = await engine.cache.resolveSymbolicLinks();
-      final actual = await directory.resolveSymbolicLinks();
-      if (!p.equals(p.dirname(actual), root)) return null;
       handle = await File(path).open();
       if (await handle.length() < end + 1) return null;
       await handle.setPosition(start);
@@ -291,15 +309,11 @@ class DownloadManager extends ChangeNotifier {
   Future<void> recoverInterrupted() async {
     if (_closing) return;
     final ids = _interrupted.toList();
-    for (final id in ids) {
-      if (_tasks[id]?.status == DownloadStatus.paused) {
-        // resume commits this ID together with its new pending status. Keep
-        // later IDs recoverable if the process dies halfway through this loop.
-        await resume(id);
-      } else {
-        _interrupted.remove(id);
-      }
-    }
+    final result = await batch(ids, DownloadBatchAction.resume);
+    if (result.failed.isNotEmpty) throw result.failed.values.first;
+    _interrupted.removeWhere(
+      (id) => _tasks[id]?.status != DownloadStatus.paused,
+    );
     await _persist();
     await _syncForeground();
     DiagnosticLog.event(
@@ -311,6 +325,7 @@ class DownloadManager extends ChangeNotifier {
   Future<void> initialize() async {
     // Recovery is explicitly authorized by the native service after startup.
     if (_initialised) return;
+    final watch = Stopwatch()..start();
     _loadSnapshot();
     await _persist();
     _initialised = true;
@@ -318,6 +333,14 @@ class DownloadManager extends ChangeNotifier {
     _background(cleanups.drain());
     _background(_drainRemovedDownloads());
     _background(_drainCompletedCaches());
+    DiagnosticLog.event(
+      'download.queue_loaded',
+      fields: {
+        'count': _tasks.length,
+        'interrupted': _interrupted.length,
+        'elapsedMs': watch.elapsedMilliseconds,
+      },
+    );
   }
 
   Future<void> discardInterrupted() async {
@@ -365,6 +388,9 @@ class DownloadManager extends ChangeNotifier {
 
   Future<void> _persist({
     Json addedTorrents = const {},
+    Json cacheRoots = const {},
+    bool changeDestination = false,
+    String? destination,
     String? removedDownload,
     List<String> removedDownloads = const [],
     List<DownloadCleanup?> removedCleanups = const [],
@@ -380,6 +406,17 @@ class DownloadManager extends ChangeNotifier {
       draft['downloadRecovery'] = _interrupted
           .where((id) => !removed.contains(id))
           .toList();
+      if (cacheRoots.isNotEmpty) {
+        draft['downloadCacheRoots'] = <String, dynamic>{
+          ...draft.obj('downloadCacheRoots'),
+          ...cacheRoots,
+        }..removeWhere((_, value) => value == null);
+      }
+      if (changeDestination) {
+        draft['settings'] = AppSettings.fromJson(
+          draft.obj('settings'),
+        ).update({'destination': destination}).toJson();
+      }
       final used = retained
           .where((t) => t.spec.isTorrent)
           .map((t) => t.spec.torrent!.str('hash'))
@@ -435,8 +472,8 @@ class DownloadManager extends ChangeNotifier {
     );
   }
 
-  Future<String> enqueue(DownloadSpec spec) async =>
-      (await enqueueAll([spec])).single;
+  Future<String> enqueue(DownloadSpec spec, {int? connections}) async =>
+      (await enqueueAll([spec], connections: connections)).single;
 
   void _notifyGuestDownload(String id, {bool attempted = false}) {
     final task = _tasks[id];
@@ -457,82 +494,132 @@ class DownloadManager extends ChangeNotifier {
     }
   }
 
-  Future<List<String>> enqueueAll(List<DownloadSpec> specs) =>
-      _pumpGate.run(() async {
-        require(!_closing, '应用正在退出');
-        RequestScope.checkpoint();
-        require(specs.isNotEmpty && specs.length <= 10000, '请选择 1–10000 个文件');
-        final options = settings;
-        final tasks = <DownloadTask>[];
-        for (final spec in specs) {
-          if (spec.platform case final platform?) {
-            checkNewCloudTask?.call(platform);
-          }
-          if (spec.needsPreparation) {
-            final origin = DownloadOrigin.fromJson(spec.source!);
-            require(
-              origin.file.id.isNotEmpty && !origin.file.isDirectory,
-              '下载文件信息不完整',
-            );
-          } else {
-            _validateDownloadUrl(spec);
-          }
-          final safeSpec = spec.copyWith(
-            fileName: safeFileName(spec.fileName),
-            relativePath: safeRelativePath(spec.relativePath),
-          );
-          tasks.add(
-            DownloadTask(
-              id: newId(),
-              spec: safeSpec,
-              createdAt: DateTime.now().millisecondsSinceEpoch,
-              total: spec.expectedSize,
-              connections: options.connectionsFor(spec.platform, spec.profile),
-              retries: options.retries,
-              speedLimit: options.speedLimit,
-              destination: options.destination,
-              phase: spec.needsPreparation ? '等待获取下载链接' : '',
-              connectionOptions: spec.needsPreparation
-                  ? {
-                      'default': options.threads,
-                      for (final profile in AppSettings.profiles.keys)
-                        profile: options.connectionsFor(spec.platform, profile),
-                    }
-                  : const {},
-            ),
-          );
-        }
-        for (final task in tasks) {
-          _tasks[task.id] = task;
-        }
-        try {
-          await _persist();
-        } catch (_) {
-          for (final task in tasks) {
-            _tasks.remove(task.id);
-          }
-          rethrow;
-        }
-        final guestBatch = _GuestDownloadBatch();
-        for (final task in tasks) {
-          _guestDownloadBatches[task.id] = guestBatch;
-          _notifyGuestDownload(task.id);
-          await cleanups.release(task.spec.cleanup);
-          DiagnosticLog.event(
-            'download.enqueue',
-            fields: {
-              'ref': DiagnosticLog.reference(task.id),
-              'platform': task.spec.platform?.name,
-              'bytes': task.total,
-              'connections': task.connections,
-              'preparing': task.spec.needsPreparation,
+  Future<List<String>> enqueueAll(
+    List<DownloadSpec> specs, {
+    String? destination,
+    int? connections,
+  }) => _pumpGate.run(() async {
+    require(!_closing, '应用正在退出');
+    RequestScope.checkpoint();
+    require(specs.isNotEmpty && specs.length <= 10000, '请选择 1–10000 个文件');
+    require(
+      connections == null || connections >= 1 && connections <= 512,
+      '线程数请输入 1–512 之间的整数',
+    );
+    final watch = Stopwatch()..start();
+    final options = settings;
+    // Capture a one-task choice without changing global preferences. Provider
+    // limits (Baidu account, Aliyun, LAN) still apply through connectionsFor.
+    final connectionSettings = connections == null
+        ? options
+        : AppSettings(
+            threads: connections,
+            threadOverrides: {
+              for (final profile in AppSettings.profiles.keys)
+                profile: connections,
             },
           );
-        }
-        notifyListeners();
-        _schedule();
-        return tasks.map((task) => task.id).toList();
-      });
+    final target = destination ?? options.destination;
+    final cacheRoot = await files.downloadCacheRoot(target);
+    final tasks = <DownloadTask>[];
+    for (final spec in specs) {
+      if (tasks.isNotEmpty && tasks.length % 128 == 0) {
+        await RequestScope.wait(Duration.zero);
+        require(!_closing, '应用正在退出');
+      }
+      if (spec.platform case final platform?) {
+        checkNewCloudTask?.call(platform);
+      }
+      if (spec.needsPreparation) {
+        final origin = DownloadOrigin.fromJson(spec.source!);
+        require(
+          origin.file.id.isNotEmpty && !origin.file.isDirectory,
+          '下载文件信息不完整',
+        );
+      } else {
+        _validateDownloadUrl(spec);
+      }
+      final safeSpec = spec.copyWith(
+        fileName: safeFileName(spec.fileName),
+        relativePath: safeRelativePath(spec.relativePath),
+        profile: BaiduShareRoute.downloadProfile(spec),
+      );
+      tasks.add(
+        DownloadTask(
+          id: newId(),
+          spec: safeSpec,
+          createdAt: DateTime.now().millisecondsSinceEpoch,
+          total: spec.expectedSize,
+          connections: connectionSettings.connectionsFor(
+            safeSpec.platform,
+            safeSpec.profile,
+          ),
+          retries: options.retries,
+          speedLimit: options.speedLimit,
+          destination: target,
+          phase: spec.needsPreparation ? '等待获取下载链接' : '',
+          connectionOptions: spec.needsPreparation
+              ? {
+                  'default': connectionSettings.threads,
+                  for (final profile in AppSettings.profiles.keys)
+                    profile: connectionSettings.connectionsFor(
+                      spec.platform,
+                      profile,
+                    ),
+                }
+              : const {},
+        ),
+      );
+    }
+    RequestScope.checkpoint();
+    for (final task in tasks) {
+      _tasks[task.id] = task;
+    }
+    try {
+      await _persist(
+        cacheRoots: {
+          if (cacheRoot != null)
+            for (final task in tasks) task.id: cacheRoot,
+        },
+      );
+    } catch (_) {
+      for (final task in tasks) {
+        _tasks.remove(task.id);
+      }
+      rethrow;
+    }
+    final guestBatch = _GuestDownloadBatch();
+    var reported = 0;
+    for (final task in tasks) {
+      _guestDownloadBatches[task.id] = guestBatch;
+      _notifyGuestDownload(task.id);
+      await cleanups.release(task.spec.cleanup);
+      if (tasks.length <= 64) {
+        DiagnosticLog.event(
+          'download.enqueue',
+          fields: {
+            'ref': DiagnosticLog.reference(task.id),
+            'platform': task.spec.platform?.name,
+            'bytes': task.total,
+            'connections': task.connections,
+            'preparing': task.spec.needsPreparation,
+          },
+        );
+      }
+      if (++reported % 128 == 0) await Future<void>.delayed(Duration.zero);
+    }
+    DiagnosticLog.event(
+      'download.batch_enqueued',
+      fields: {
+        'count': tasks.length,
+        'queueSize': _tasks.length,
+        'elapsedMs': watch.elapsedMilliseconds,
+      },
+    );
+    notifyListeners();
+    _schedule();
+    return tasks.map((task) => task.id).toList();
+  });
 
   void _validateDownloadUrl(DownloadSpec spec) {
     final uri = Uri.tryParse(spec.url);
@@ -545,68 +632,75 @@ class DownloadManager extends ChangeNotifier {
     );
   }
 
-  Future<List<String>> enqueueTorrent(
-    TorrentInfo info,
-    List<int> selected,
-  ) async {
-    require(!_closing, '应用正在退出');
-    final indices = selected.toSet().toList()..sort();
-    require(
-      indices.isNotEmpty &&
-          indices.length <= 1000 &&
-          indices.every((i) => i >= 0 && i < info.files.length),
-      '每次请选择 1–1000 个文件',
-    );
-    require(
-      !_tasks.values.any(
-        (t) =>
-            !t.terminal &&
-            t.spec.torrent?.str('hash') == info.hash &&
-            indices.contains(t.spec.torrent!.integer('index')),
-      ),
-      '选中的文件已有下载任务，请在下载页继续',
-    );
-    final ids = <String>[], options = settings;
-    for (final index in indices) {
-      final file = info.files[index], id = newId();
-      ids.add(id);
-      _tasks[id] = DownloadTask(
-        id: id,
-        createdAt: DateTime.now().millisecondsSinceEpoch,
-        spec: DownloadSpec(
-          url: info.magnet,
-          fileName: safeFileName(file.name),
-          relativePath: safeRelativePath(file.directory),
-          expectedSize: file.size,
-          torrent: {'hash': info.hash, 'index': file.index, 'path': file.path},
-        ),
-        total: file.size,
-        connections: 80,
-        retries: options.retries,
-        speedLimit: options.speedLimit,
-        destination: options.destination,
-      );
-    }
-    try {
-      await _persist(
-        addedTorrents: {
-          info.hash: {
-            'data': info.data,
-            'name': info.name,
-            'pieceLength': info.pieceLength,
-          },
-        },
-      );
-    } catch (_) {
-      for (final id in ids) {
-        _tasks.remove(id);
-      }
-      rethrow;
-    }
-    notifyListeners();
-    _schedule();
-    return ids;
-  }
+  Future<List<String>> enqueueTorrent(TorrentInfo info, List<int> selected) =>
+      _pumpGate.run(() async {
+        require(!_closing, '应用正在退出');
+        final indices = selected.toSet().toList()..sort();
+        require(
+          indices.isNotEmpty &&
+              indices.length <= 1000 &&
+              indices.every((i) => i >= 0 && i < info.files.length),
+          '每次请选择 1–1000 个文件',
+        );
+        require(
+          !_tasks.values.any(
+            (t) =>
+                !t.terminal &&
+                t.spec.torrent?.str('hash') == info.hash &&
+                indices.contains(t.spec.torrent!.integer('index')),
+          ),
+          '选中的文件已有下载任务，请在下载页继续',
+        );
+        final ids = <String>[], options = settings;
+        final cacheRoot = await files.downloadCacheRoot(options.destination);
+        for (final index in indices) {
+          final file = info.files[index], id = newId();
+          ids.add(id);
+          _tasks[id] = DownloadTask(
+            id: id,
+            createdAt: DateTime.now().millisecondsSinceEpoch,
+            spec: DownloadSpec(
+              url: info.magnet,
+              fileName: safeFileName(file.name),
+              relativePath: safeRelativePath(file.directory),
+              expectedSize: file.size,
+              torrent: {
+                'hash': info.hash,
+                'index': file.index,
+                'path': file.path,
+              },
+            ),
+            total: file.size,
+            connections: 80,
+            retries: options.retries,
+            speedLimit: options.speedLimit,
+            destination: options.destination,
+          );
+        }
+        try {
+          await _persist(
+            cacheRoots: {
+              if (cacheRoot != null)
+                for (final id in ids) id: cacheRoot,
+            },
+            addedTorrents: {
+              info.hash: {
+                'data': info.data,
+                'name': info.name,
+                'pieceLength': info.pieceLength,
+              },
+            },
+          );
+        } catch (_) {
+          for (final id in ids) {
+            _tasks.remove(id);
+          }
+          rethrow;
+        }
+        notifyListeners();
+        _schedule();
+        return ids;
+      });
 
   void _schedule() {
     if (_closing || _pausingAll != null) return;
@@ -697,6 +791,110 @@ class DownloadManager extends ChangeNotifier {
       }
     }
     _schedule();
+  }
+
+  /// Changing destinations never moves a live payload or discards a native
+  /// checkpoint. Only tasks that have no cache yet adopt the new cache root.
+  Future<int> changeDestination(
+    String? destination, {
+    bool includeUnfinished = false,
+  }) async {
+    require(!_closing, '应用正在退出');
+    final cacheRoot = await files.downloadCacheRoot(destination);
+    var changed = 0;
+    try {
+      await _pumpGate.run(() async {
+        require(!_closing, '应用正在退出');
+        RequestScope.checkpoint();
+        if (!includeUnfinished) {
+          await _persist(changeDestination: true, destination: destination);
+          return;
+        }
+        final ids = _tasks.values
+            .where((task) => !task.terminal)
+            .map((task) => task.id)
+            .toList();
+        final applied = await _withTaskControls(ids, () async {
+          var paused = false;
+          for (final id in ids) {
+            final task = _tasks[id];
+            if (task?.active != true) continue;
+            _running[id]?.stop();
+            _interrupted.remove(id);
+            _tasks[id] = task!.update({
+              'status': 'paused',
+              'speed': 0,
+              'phase': '',
+            });
+            paused = true;
+          }
+          // Persist an explicit pause even if the directory change later
+          // fails. Join export writers before replacing their destination.
+          try {
+            if (paused) await _persist();
+          } finally {
+            await Future.wait([
+              for (final id in ids)
+                if (_running.containsKey(id)) _stop(id),
+            ]);
+          }
+          final originals = <String, DownloadTask>{};
+          final replacements = <String, DownloadTask>{};
+          final roots = <String, dynamic>{};
+          for (final id in ids) {
+            if (replacements.isNotEmpty && replacements.length % 64 == 0) {
+              await RequestScope.wait(Duration.zero);
+              require(!_closing, '应用正在退出');
+            }
+            final task = _tasks[id];
+            if (task == null || task.terminal) continue;
+            originals[id] = task;
+            replacements[id] = task.update({'destination': destination});
+            if (cacheRoot != null &&
+                !p.equals(engine.taskCacheRoot(id).path, cacheRoot) &&
+                task.downloaded == 0 &&
+                !task.payloadReady &&
+                await FileSystemEntity.type(
+                      engine.taskDirectory(id).path,
+                      followLinks: false,
+                    ) ==
+                    FileSystemEntityType.notFound &&
+                await Directory(
+                  p.rootPrefix(engine.taskCacheRoot(id).absolute.path),
+                ).exists()) {
+              roots[id] = cacheRoot;
+            }
+          }
+          RequestScope.checkpoint();
+          require(!_closing, '应用正在退出');
+          _tasks.addAll(replacements);
+          try {
+            await _persist(
+              cacheRoots: roots,
+              changeDestination: true,
+              destination: destination,
+            );
+          } catch (_) {
+            for (final entry in originals.entries) {
+              if (identical(_tasks[entry.key], replacements[entry.key])) {
+                _tasks[entry.key] = entry.value;
+              }
+            }
+            rethrow;
+          }
+          changed = replacements.length;
+        });
+        require(applied, '修改下载目录已取消');
+      });
+      DiagnosticLog.event(
+        'download.destination_changed',
+        fields: {'includeUnfinished': includeUnfinished, 'updated': changed},
+      );
+      return changed;
+    } finally {
+      notifyListeners();
+      _schedule();
+    }
   }
 
   /// Playback gets BT bandwidth without changing a user's explicit pause.
@@ -797,7 +995,7 @@ class DownloadManager extends ChangeNotifier {
 
   Future<void> _pauseAll(String reason) async {
     _interrupted.clear();
-    final ids = _tasks.values.where((t) => t.active).map((t) => t.id).toList();
+    final ids = _tasks.values.where((t) => t.active).map((t) => t.id).toSet();
     // Mark all pending tasks before the first writer finishes and frees a slot.
     for (final id in ids) {
       _running[id]?.stop();
@@ -807,31 +1005,164 @@ class DownloadManager extends ChangeNotifier {
         'phase': '',
       });
     }
-    await _persist();
-    await Future.wait(ids.map(pause));
-    if (reason.isNotEmpty) {
-      for (final id in ids) {
-        if (_tasks[id]?.status == DownloadStatus.paused) {
-          _tasks[id] = _tasks[id]!.update({'phase': reason});
-        }
+    await _pumpGate.run(() async {
+      // Also cover a batch that was still committing when pause-all started.
+      for (final task in _tasks.values.where((task) => task.active).toList()) {
+        ids.add(task.id);
+        _running[task.id]?.stop();
+        _tasks[task.id] = task.update({
+          'status': 'paused',
+          'speed': 0,
+          'phase': '',
+        });
       }
       await _persist();
-      DiagnosticLog.event(
-        'download.service_paused',
-        fields: {'reason': reason, 'count': ids.length},
-      );
-    }
+      // Queued files have no writer. Calling pause() on each of them used to
+      // rewrite the entire queue once per file during shutdown.
+      await Future.wait([
+        for (final id in ids)
+          if (_running.containsKey(id)) _control(id, () => _stop(id)),
+      ]);
+      if (reason.isNotEmpty) {
+        for (final id in ids) {
+          if (_tasks[id]?.status == DownloadStatus.paused) {
+            _tasks[id] = _tasks[id]!.update({'phase': reason});
+          }
+        }
+        await _persist();
+        DiagnosticLog.event(
+          'download.service_paused',
+          fields: {'reason': reason, 'count': ids.length},
+        );
+      }
+    });
     await _syncForeground();
     notifyListeners();
   }
 
   Future<void> resumeAll() async {
-    for (final task in tasks) {
-      if (task.status == DownloadStatus.paused ||
-          task.status == DownloadStatus.failed) {
-        await resume(task.id);
+    final result = await batch(
+      tasks.where(DownloadBatchAction.resume.accepts).map((task) => task.id),
+      DownloadBatchAction.resume,
+    );
+    if (result.failed.isNotEmpty) throw result.failed.values.first;
+  }
+
+  Future<DownloadBatchResult> _changeStatuses(
+    List<String> ids,
+    DownloadBatchAction action,
+  ) async {
+    final succeeded = <String>[], skipped = <String>[];
+    final failed = <String, Object>{};
+    var cancelled = false;
+    Future<void> commit() async {
+      final originals = <String, DownloadTask>{},
+          changed = <String, DownloadTask>{};
+      final recovered = _interrupted.intersection(ids.toSet());
+      for (final id in ids) {
+        final task = _tasks[id];
+        if (task == null || !action.accepts(task)) {
+          skipped.add(id);
+          continue;
+        }
+        originals[id] = task;
+        _interrupted.remove(id);
+        if (action == DownloadBatchAction.pause) _running[id]?.stop();
+        changed[id] = _tasks[id] = task.update({
+          'status': action == DownloadBatchAction.pause ? 'paused' : 'pending',
+          'phase': '',
+          'speed': 0,
+          if (action == DownloadBatchAction.resume) ...{
+            'error': '',
+            'recoveryAction': DownloadRecoveryAction.none.name,
+          },
+        });
       }
+      if (changed.isEmpty) return;
+      try {
+        await _persist();
+      } catch (error) {
+        for (final entry in originals.entries) {
+          // A failed resume must never be scheduled by a later queue write.
+          // Pauses remain stopped in memory, as with a single-task pause.
+          if (action == DownloadBatchAction.resume &&
+              identical(_tasks[entry.key], changed[entry.key])) {
+            _tasks[entry.key] = entry.value;
+            if (recovered.contains(entry.key)) _interrupted.add(entry.key);
+          }
+          failed[entry.key] = error;
+        }
+        notifyListeners();
+        return;
+      }
+      notifyListeners();
+      for (final id in changed.keys) {
+        try {
+          if (action == DownloadBatchAction.pause && _running.containsKey(id)) {
+            await _stop(id);
+          }
+          succeeded.add(id);
+        } catch (error) {
+          failed[id] = error;
+        }
+      }
+      DiagnosticLog.event(
+        'download.batch_status',
+        fields: {
+          'action': action.name,
+          'count': succeeded.length,
+          'failed': failed.length,
+        },
+      );
     }
+
+    cancelled = !await _withTaskControls(ids, commit);
+    return DownloadBatchResult(
+      succeeded: succeeded,
+      skipped: skipped,
+      failed: failed,
+      cancelled: cancelled || RequestScope.current?.isCancelled == true,
+    );
+  }
+
+  Future<bool> _withTaskControls(
+    List<String> ids,
+    Future<void> Function() action,
+  ) async {
+    // Hold per-task controls with a flat barrier. Nesting one Future per task
+    // overflows the stack when thousands of nested gates complete at once.
+    final release = Completer<void>();
+    final controls = <Future<void>>[];
+    final entered = <Future<void>>[];
+    var cancelled = false;
+    try {
+      // Reserve every selected control before yielding. A later single-task
+      // pause/delete must run after this batch, including its last selected ID.
+      for (final id in ids) {
+        final ready = Completer<void>();
+        controls.add(
+          _control(id, () {
+            ready.complete();
+            return release.future;
+          }),
+        );
+        entered.add(ready.future);
+      }
+      for (var index = 0; index < entered.length; index += 128) {
+        if (index > 0) await Future<void>.delayed(Duration.zero);
+        if (_closing || RequestScope.current?.isCancelled == true) {
+          cancelled = true;
+          break;
+        }
+        await Future.wait(entered.skip(index).take(128));
+      }
+      cancelled |= _closing || RequestScope.current?.isCancelled == true;
+      if (!cancelled) await action();
+    } finally {
+      release.complete();
+      await Future.wait(controls);
+    }
+    return !cancelled;
   }
 
   Future<DownloadBatchResult> batch(
@@ -845,6 +1176,9 @@ class DownloadManager extends ChangeNotifier {
       // Hold scheduling so stopping one writer cannot start another selected
       // queued task before its pause or deletion is processed.
       return await _pumpGate.run(() async {
+        if (action != DownloadBatchAction.delete) {
+          return _changeStatuses(selected, action);
+        }
         final succeeded = <String>[], skipped = <String>[];
         final failed = <String, Object>{};
         var cancelled = false;
@@ -1062,6 +1396,10 @@ class DownloadManager extends ChangeNotifier {
           draft['downloadRemovals'] = (draft['downloadRemovals'] as List? ?? [])
               .where((value) => value != id)
               .toList();
+          final roots = draft.obj('downloadCacheRoots')..remove(id);
+          if (draft.containsKey('downloadCacheRoots')) {
+            draft['downloadCacheRoots'] = roots;
+          }
         });
       } catch (error, stack) {
         DiagnosticLog.error(
@@ -1106,11 +1444,8 @@ class DownloadManager extends ChangeNotifier {
   Future<void> _deleteCache(String id) =>
       (_cacheAccess[id] ??= AsyncGate()).run(() async {
         _readable.remove(id);
-        final directory = engine.taskDirectory(id);
-        if (!await directory.exists()) return;
-        final root = await engine.cache.resolveSymbolicLinks(),
-            actual = await directory.resolveSymbolicLinks();
-        require(p.equals(p.dirname(actual), root), '缓存路径发生变化，已停止删除');
+        final directory = await engine.checkedTaskDirectory(id);
+        if (directory == null) return;
         await directory.delete(recursive: true);
       });
 
@@ -1123,7 +1458,7 @@ class DownloadManager extends ChangeNotifier {
       await _syncForeground();
       run.check();
       run.storage = await files.storagePlan(
-        engine.cache.path,
+        engine.taskCacheRoot(id).path,
         _tasks[id]!.destination,
       );
       _volumePaths[run.storage.cache.id] = run.storage.cache.path;
@@ -1138,6 +1473,7 @@ class DownloadManager extends ChangeNotifier {
       File? output;
       final old = _tasks[id]!;
       if (old.payloadReady) {
+        await engine.checkedTaskDirectory(id);
         final cached = File(
           p.join(
             engine.taskDirectory(id).path,
@@ -1179,6 +1515,12 @@ class DownloadManager extends ChangeNotifier {
                 );
               }
             }
+          } on _RecoverAliyun {
+            await engine.pause(id);
+            run.check();
+            await _update(id, {'phase': '正在恢复阿里下载连接', 'speed': 0});
+            await run.delay(Duration(seconds: 2 * run.aliyunRecovery.attempts));
+            run.check();
           } on DownloadHttpException catch (e) {
             if (!e.mayRefresh ||
                 refresh >= 2 ||
@@ -1187,7 +1529,12 @@ class DownloadManager extends ChangeNotifier {
             }
             refresh++;
             await engine.pause(id);
-            await _prepareSource(id, run);
+            await _prepareSource(
+              id,
+              run,
+              preserveProgress:
+                  _isAliyun(_tasks[id]!.spec) && _tasks[id]!.downloaded > 0,
+            );
           }
         }
       }
@@ -1311,6 +1658,16 @@ class DownloadManager extends ChangeNotifier {
         }
         final message = run.stopped || e is _Stopped
             ? ''
+            : _tasks[id]?.spec.profile == 'lan' &&
+                  e is DownloadHttpException &&
+                  e.status == 410
+            ? '设备互联分享已结束或过期，请让发送方重新分享'
+            : _tasks[id]?.spec.profile == 'lan' &&
+                  e is DownloadHttpException &&
+                  e.status == 409
+            ? '发送方的源文件已修改，请重新分享后接收'
+            : _tasks[id]?.spec.profile == 'lan' && e is DownloadNetworkException
+            ? '无法连接发送设备，请确认处于同一局域网且对方保持分享开启'
             : e is AppException
             ? e.message
             : e is FileSystemException
@@ -1427,13 +1784,14 @@ class DownloadManager extends ChangeNotifier {
       }
       final profile = settings.connectionProfileFor(
         fresh.platform,
-        fresh.profile,
+        BaiduShareRoute.downloadProfile(fresh),
       );
       final spec = fresh
           .copyWith(
             fileName: previous.spec.fileName,
             relativePath: previous.spec.relativePath,
             appUpdateKey: previous.spec.appUpdateKey,
+            profile: BaiduShareRoute.downloadProfile(fresh),
           )
           .toJson();
       if (fresh.expectedSize <= 0 && previous.spec.expectedSize > 0) {
@@ -1447,10 +1805,11 @@ class DownloadManager extends ChangeNotifier {
       try {
         await _update(id, {
           'spec': spec,
-          'connections':
-              fresh.platform == CloudPlatform.baidu ||
-                  profile == 'baidu' ||
-                  profile == 'baidu_preview'
+          'connections': BaiduShareRoute.usesAccountDownload(fresh)
+              ? 1
+              : BaiduShareRoute.usesPublicDownload(previous.spec) &&
+                    previous.spec.profile !=
+                        BaiduShareRoute.publicDownloadProfile
               ? settings.connectionsFor(fresh.platform, profile)
               : previous.spec.needsPreparation
               ? previous.connectionOptions[profile ?? 'default'] ??
@@ -1571,6 +1930,7 @@ class DownloadManager extends ChangeNotifier {
     final probe = await _probe(id, run);
     run.check();
     if (probe.hls) return _hls(id, run);
+    final aliyun = _isAliyun(task.spec);
     require(
       !(task.spec.expectedSize > 0 &&
           probe.identity.total > 0 &&
@@ -1578,6 +1938,10 @@ class DownloadManager extends ChangeNotifier {
       '远端文件长度已变化，请重新添加下载',
     );
     if (!task.identity.canResume(probe.identity)) {
+      require(
+        !aliyun || task.downloaded == 0,
+        '阿里文件的断点信息发生变化，已保留下载进度，请刷新文件列表后确认',
+      );
       await engine.remove(id);
       await _deleteCache(id);
       await _update(id, {'downloaded': 0, 'hls': {}});
@@ -1588,13 +1952,17 @@ class DownloadManager extends ChangeNotifier {
     await _update(id, {
       'identity': probe.identity.toJson(),
       'total': total,
-      if (task.spec.platform == CloudPlatform.baidu ||
-          task.spec.profile == 'baidu' ||
-          task.spec.profile == 'baidu_preview')
+      if (BaiduShareRoute.usesAccountDownload(task.spec)) 'connections': 1,
+      if (BaiduShareRoute.usesPublicDownload(task.spec) &&
+          task.spec.profile != BaiduShareRoute.publicDownloadProfile) ...{
+        'spec': task.spec
+            .copyWith(profile: BaiduShareRoute.publicDownloadProfile)
+            .toJson(),
         'connections': settings.connectionsFor(
           task.spec.platform,
-          task.spec.profile,
+          BaiduShareRoute.publicDownloadProfile,
         ),
+      },
       'payloadReady': false,
       'phase': '',
     });
@@ -1613,19 +1981,23 @@ class DownloadManager extends ChangeNotifier {
         'id': id,
         'url': task.spec.url,
         'headers': headers,
-        'connections': task.connections,
+        'connections': aliyun
+            ? run.aliyunRecovery.connections(task.connections)
+            : task.connections,
         'connectionProfile': settings.connectionProfileFor(
           task.spec.platform,
-          task.spec.profile,
+          BaiduShareRoute.downloadProfile(task.spec),
         ),
         'retries': task.retries,
         'speedLimit': task.speedLimit,
+        if (aliyun) 'aliyunGroup': _aliyunAccountGroup(task.spec),
       });
     });
     var persisted = 0;
-    final baidu =
-        task.spec.platform == CloudPlatform.baidu ||
-        {'baidu', 'baidu_preview'}.contains(task.spec.profile);
+    if (aliyun) {
+      run.aliyunRecovery.start(run.clock.elapsed, task.downloaded);
+    }
+    final baidu = BaiduShareRoute.usesAccountDownload(task.spec);
     if (baidu) {
       run.baiduRecovery.start(run.clock.elapsed, task.downloaded);
       DiagnosticLog.event(
@@ -1661,6 +2033,37 @@ class DownloadManager extends ChangeNotifier {
         '远端文件内容已变化，请重新添加下载',
       );
       final currentTotal = nativeTotal > 0 ? nativeTotal : total;
+      final aliyunPolicy = aliyun ? state.obj('aliyun') : <String, dynamic>{};
+      final aliyunLimit = aliyunPolicy.integer(
+        'limit',
+        run.aliyunRecovery.connections(task.connections),
+      );
+      final aliyunWaitMs = aliyunPolicy.integer('waitMs');
+      final aliyunQueued = aliyunPolicy.boolean('queued');
+      final aliyunWaiting = aliyunWaitMs > 0 || aliyunQueued;
+      final aliyunPhase = state.integer('activeConnections') > 0
+          ? ''
+          : aliyunWaitMs > 0
+          ? '阿里下载 ${(aliyunWaitMs + 999) ~/ 1000} 秒后重试'
+          : aliyunQueued
+          ? '等待阿里下载连接'
+          : '';
+      if (aliyun &&
+          (run.aliyunPolicyLimit != aliyunLimit ||
+              run.aliyunWaiting != aliyunWaiting)) {
+        run.aliyunPolicyLimit = aliyunLimit;
+        run.aliyunWaiting = aliyunWaiting;
+        DiagnosticLog.event(
+          'download.aliyun_policy',
+          fields: {
+            'ref': DiagnosticLog.reference(id),
+            'limit': aliyunLimit,
+            'active': state.integer('activeConnections'),
+            'waitMs': aliyunWaitMs,
+            'queued': aliyunQueued,
+          },
+        );
+      }
       final ranges = <(int, int)>[];
       for (final value in state['readableRanges'] as List? ?? const []) {
         if (value is List &&
@@ -1684,12 +2087,14 @@ class DownloadManager extends ChangeNotifier {
           'total': currentTotal,
           'downloaded': downloaded,
           'speed': state.integer('speed'),
+          if (aliyun) 'phase': aliyunPhase,
         }, progress: true);
       } else {
         await _update(id, {
           'total': currentTotal,
           'downloaded': downloaded,
           'speed': state.integer('speed'),
+          if (aliyun) 'phase': aliyunPhase,
         }, persist: false);
       }
       if (state.str('status') == 'done') {
@@ -1728,6 +2133,33 @@ class DownloadManager extends ChangeNotifier {
       if (state.str('status') == 'pause') {
         run.check();
         throw const AppException('下载组件已暂停，请继续任务');
+      }
+      if (aliyun &&
+          run.aliyunRecovery.observe(
+            now: run.clock.elapsed,
+            downloaded: downloaded,
+            total: currentTotal,
+            currentLimit: aliyunLimit,
+            retries: task.retries,
+            canRecover:
+                state.str('status') == 'running' &&
+                !aliyunWaiting &&
+                task.speedLimit == 0 &&
+                probe.rangeSupported &&
+                probe.identity.ifRange != null &&
+                !_playbackHolds.containsKey(id),
+          )) {
+        DiagnosticLog.event(
+          'download.aliyun_recovery',
+          fields: {
+            'ref': DiagnosticLog.reference(id),
+            'attempt': run.aliyunRecovery.attempts,
+            'downloaded': downloaded,
+            'limit': run.aliyunRecovery.connections(task.connections),
+            'stallMs': AliyunTransferRecovery.stallWindow.inMilliseconds,
+          },
+        );
+        throw _RecoverAliyun();
       }
       if (baidu) {
         final sample = run.baiduRecovery.observe(
@@ -1907,7 +2339,7 @@ class DownloadManager extends ChangeNotifier {
       index = 0;
       retained = 0;
     }
-    await directory.create(recursive: true);
+    await engine.checkedTaskDirectory(id, create: true);
     final handle = await output.open(mode: FileMode.append);
     await handle.truncate(retained);
     await handle.setPosition(retained);

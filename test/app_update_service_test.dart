@@ -59,6 +59,25 @@ void main() {
   );
 
   test(
+    'Redownloading a failed update discards the old task and resolves the share again',
+    () async {
+      await f.service.start(f.current!);
+      final oldId = f.downloads.tasks.single.id;
+      f.downloads.change(oldId, {'status': 'failed', 'error': '文件校验失败'});
+      f.connector.opened = null;
+      f.connector.entries = [
+        const CloudFile(id: 'fresh', name: 'fresh.apk', size: 2048),
+      ];
+      expect(await f.service.start(f.current!, redownload: true), isTrue);
+      expect(f.downloads.created, 2);
+      expect(f.downloads.resumed, 0);
+      expect(f.downloads.task(oldId), isNull);
+      expect(f.connector.opened, isNotNull);
+      expect(f.downloads.tasks.single.spec.source!['file']['id'], 'fresh');
+    },
+  );
+
+  test(
     'Existing persisted update downloads are recovered without another share request',
     () async {
       await f.service.start(f.current!);

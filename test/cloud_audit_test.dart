@@ -48,6 +48,10 @@ BrowseSession _share(CloudPlatform platform) => BrowseSession(
 );
 Credential _credential(CloudPlatform platform, {int revision = 42}) =>
     Credential(platform.label, switch (platform) {
+      CloudPlatform.github => {
+        'primary': 'github_pat_fixture0123456789',
+        'username': 'fixture-user',
+      },
       CloudPlatform.ctfile => {'primary': 'fixture-session-token'},
       CloudPlatform.baidu => {'primary': 'BDUSS=fixture'},
       CloudPlatform.quark || CloudPlatform.uc => {
@@ -77,7 +81,7 @@ Credential _credential(CloudPlatform platform, {int revision = 42}) =>
       CloudPlatform.pan115 => {
         'primary': 'UID=fixture; CID=fixture; SEID=fixture',
       },
-      CloudPlatform.guangya || CloudPlatform.aliyun => {
+      CloudPlatform.pikpak || CloudPlatform.guangya || CloudPlatform.aliyun => {
         'primary': 'fixture-refresh-token',
         'accessToken': 'fixture-access-token',
         'refreshToken': 'fixture-refresh-token',
@@ -171,7 +175,9 @@ void main() {
         CloudPlatform.values
             .where(
               (platform) =>
-                  platform.requiresAccount && platform != CloudPlatform.ctfile,
+                  platform.requiresAccount &&
+                  platform != CloudPlatform.ctfile &&
+                  platform != CloudPlatform.github,
             )
             .toSet(),
       );
@@ -207,7 +213,13 @@ void main() {
           expect((await repository.personal(platform)).platform, platform);
           expect(
             http.calls.map((r) => r.uri.path),
-            platform == CloudPlatform.aliyun ? ['/v2/user/get'] : isEmpty,
+            platform == CloudPlatform.aliyun
+                ? [
+                    '/v2/user/get',
+                    // Optional album discovery also attempts device setup.
+                    '/users/v1/users/device/create_session',
+                  ]
+                : isEmpty,
           );
           final openedRequests = http.calls.length;
           await vault.removeCredential(platform);

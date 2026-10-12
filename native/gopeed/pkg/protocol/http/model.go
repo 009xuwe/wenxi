@@ -11,11 +11,19 @@ type OptsExtra struct {
 	Connections int `json:"connections"`
 	// ConnectionProfile selects the app's per-route range budget.
 	ConnectionProfile string `json:"connectionProfile,omitempty"`
+	// AliyunGroup is an app-local account digest, never an account credential.
+	AliyunGroup string `json:"aliyunGroup,omitempty"`
 	// AsterLink options; nil retains Gopeed's default of three retries.
 	RetryLimit *int  `json:"retryLimit,omitempty"`
 	SpeedLimit int64 `json:"speedLimit,omitempty"`
 	// AutoTorrent when task download complete, and it is a .torrent file, it will be auto create a new task for the torrent file
 	AutoTorrent bool `json:"autoTorrent"`
+}
+
+type AliyunTransferState struct {
+	Limit  int   `json:"limit"`
+	WaitMS int64 `json:"waitMs"`
+	Queued bool  `json:"queued"`
 }
 
 // Stats for download

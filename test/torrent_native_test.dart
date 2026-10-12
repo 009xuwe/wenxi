@@ -37,7 +37,7 @@ List<int> _bencode(Object value) {
 }
 
 void main() {
-  final executable = p.absolute('native/bin/asterlink_gopeed.exe');
+  final executable = gopeedTestExecutable();
   group(
     'BT through packaged Gopeed helper',
     () {

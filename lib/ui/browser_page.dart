@@ -6,15 +6,25 @@ import '../app_services.dart';
 import '../core/json.dart';
 import '../core/operation_progress.dart';
 import '../data/http.dart';
+import '../data/cloud_search.dart';
+import '../data/cloud_search_history.dart';
+import '../domain/cloud_search_options.dart';
 import '../domain/models.dart';
+import '../domain/baidu_share_route.dart';
+import '../domain/github.dart';
 import '../domain/settings.dart';
 import '../domain/cloud_file_time.dart';
 import '../diagnostics/app_log.dart';
 import 'app_popup_menu.dart';
+import 'account_cookie.dart';
+import 'account_info_page.dart';
+import 'cloud_accounts_page.dart';
 import 'common.dart';
 import 'baidu_download_prompt.dart';
+import 'baidu_share_route_picker.dart';
 import 'cloud_thumbnail.dart';
-import 'cloud_upload_dialog.dart';
+import 'cloud_search_page.dart';
+import '../upload/upload_task.dart';
 import 'login_page.dart';
 import 'preview_page.dart';
 import 'cloud_favorites_page.dart';
@@ -31,6 +41,8 @@ class BrowserPage extends StatefulWidget {
     this.initialItems,
     this.initialTrail,
     this.highlightedFileId,
+    this.searchPage = false,
+    this.popAtInitialDirectory = false,
   });
   final AppServices services;
   final BrowseSession session;
@@ -39,6 +51,8 @@ class BrowserPage extends StatefulWidget {
   final List<CloudFile>? initialItems;
   final List<(String, String)>? initialTrail;
   final String? highlightedFileId;
+  final bool searchPage;
+  final bool popAtInitialDirectory;
   @override
   State<BrowserPage> createState() => _BrowserPageState();
 }
@@ -50,42 +64,99 @@ class _BrowserPageState extends State<BrowserPage> {
   late final stack = <(String, String)>[
     ...widget.initialTrail ?? [(session.rootId, '全部文件')],
   ];
-  late int? accountRevision = widget.services.cloud
-      .sessionCredential(session)
-      ?.updatedAt;
+  late int? accountRevision;
   late String? highlight = widget.highlightedFileId;
   late List<CloudFile> items = List.of(widget.initialItems ?? const []);
   final selected = <String>{}, search = TextEditingController();
   final _progress = OperationProgress();
-  late bool loading = widget.initialItems == null;
+  late final CloudDirectorySearch _deepSearch;
+  bool _searchResults = false;
+  int _searchGeneration = 0;
+  Timer? _searchPaint;
+  bool _searchEntireDrive = true;
+  CloudSearchCategory _searchCategory = CloudSearchCategory.all;
+  late final _searchHistory = CloudSearchHistory(widget.services.store);
+  bool get _includeSubfolders => widget.searchPage;
+  List<(String, String)> get _searchTrail =>
+      _searchEntireDrive ? [(session.rootId, '全部文件')] : List.of(stack);
+  List<CloudFile> get _sourceItems =>
+      _searchResults ? _deepSearch.hits.map((hit) => hit.file).toList() : items;
+  CloudSearchHit? _hit(CloudFile file) =>
+      _searchResults ? _deepSearch.hitFor(file) : null;
+  String _fileKey(CloudFile file) => _hit(file)?.key ?? file.id;
+  List<(String, String)> _trailFor(CloudFile file) =>
+      _hit(file)?.trail ?? stack;
+  late bool loading = !widget.searchPage && widget.initialItems == null;
   bool changingAccount = false, pickingUpload = false;
   bool _selectionMode = false;
   bool get _selecting => _selectionMode || selected.isNotEmpty;
+  CloudConnector get _provider =>
+      widget.services.cloud.connector(session.platform);
+  bool get _canUpload => _provider.canUploadTo(session, stack.last.$1);
+  bool get _canCreateFolder =>
+      _provider.canCreateFolderIn(session, stack.last.$1);
   BrowserDisplaySettings get _display =>
       widget.services.settings.browserDisplayFor(session.platform);
-  String get view => _display.view;
+  String get view => widget.searchPage ? 'list' : _display.view;
   String get sort => _display.sort;
   bool get ascending => _display.ascending;
   String error = '';
   int generation = 0;
   RequestScope? request;
+  StreamSubscription<UploadTask>? _uploadChanges;
+  Timer? _uploadRefresh;
   late bool _available = widget.services.control.cloudEnabled(session.platform);
   @override
   void initState() {
     super.initState();
+    accountRevision = widget.services.cloud
+        .sessionCredential(session)
+        ?.updatedAt;
+    _deepSearch = CloudDirectorySearch(
+      read: widget.services.cloud.list,
+      directoryId: widget.services.cloud.directoryId,
+      validate: (captured) {
+        require(identical(captured, session), '账号或目录已变化，请重新搜索');
+        _checkAccount();
+      },
+    )..addListener(_searchChanged);
+    if (widget.initialItems != null) {
+      _deepSearch.remember(session, stack.last.$1, items);
+    }
     if (highlight != null) {
       search.text =
           items.where((f) => f.id == highlight).firstOrNull?.name ?? '';
     }
     widget.services.control.addListener(_controlChanged);
     widget.services.store.addListener(_profileChanged);
-    if (widget.initialItems == null) _load();
+    _uploadChanges = widget.services.uploads.completions.stream.listen((task) {
+      if (!mounted ||
+          task.session.platform != session.platform ||
+          task.session.accountId != session.accountId ||
+          task.session.personalSpaceId != session.personalSpaceId ||
+          (!_searchResults && task.parent != stack.last.$1)) {
+        return;
+      }
+      _uploadRefresh?.cancel();
+      _uploadRefresh = Timer(const Duration(milliseconds: 400), () {
+        if (mounted &&
+            (_searchResults || task.parent == stack.last.$1) &&
+            task.session.accountId == session.accountId) {
+          unawaited(_refresh(preserveSelection: true));
+        }
+      });
+    });
+    if (!widget.searchPage && widget.initialItems == null) _load();
   }
 
   @override
   void dispose() {
     widget.services.control.removeListener(_controlChanged);
     widget.services.store.removeListener(_profileChanged);
+    _uploadChanges?.cancel();
+    _uploadRefresh?.cancel();
+    _searchPaint?.cancel();
+    _deepSearch.dispose();
     request?.cancel();
     _progress.dispose();
     search.dispose();
@@ -101,8 +172,13 @@ class _BrowserPageState extends State<BrowserPage> {
     }
     _available = available;
     if (available) {
-      unawaited(_load());
+      if (widget.searchPage) {
+        setState(() {});
+      } else {
+        unawaited(_load());
+      }
     } else {
+      _resetSearch(clearCache: true);
       request?.cancel();
       _progress.close(cancelled: true);
       generation++;
@@ -115,7 +191,198 @@ class _BrowserPageState extends State<BrowserPage> {
   }
 
   void _profileChanged() {
+    if ((_searchResults || widget.searchPage) &&
+        accountRevision !=
+            widget.services.cloud.sessionCredential(session)?.updatedAt) {
+      _resetSearch(clearCache: true);
+      error = '账号已变化，请重新打开文件列表';
+    }
     if (mounted) setState(() {});
+  }
+
+  void _searchChanged() {
+    if (!mounted || !_searchResults) return;
+    if (!_deepSearch.running) {
+      _searchPaint?.cancel();
+      _searchPaint = null;
+      setState(() {});
+    } else {
+      _searchPaint ??= Timer(const Duration(milliseconds: 80), () {
+        _searchPaint = null;
+        if (mounted && _searchResults) setState(() {});
+      });
+    }
+  }
+
+  void _resetSearch({bool clearCache = false}) {
+    _searchGeneration++;
+    _searchResults = false;
+    _searchPaint?.cancel();
+    _searchPaint = null;
+    _deepSearch.clear();
+    if (clearCache) _deepSearch.clearCache();
+    selected.clear();
+    _selectionMode = false;
+  }
+
+  void _editSearch() => setState(() {
+    if (_searchResults) _resetSearch();
+    highlight = null;
+  });
+
+  Future<void> _changeSearchScope(bool entireDrive) async {
+    if (_searchEntireDrive == entireDrive) return;
+    final restart = _searchResults;
+    setState(() {
+      _resetSearch();
+      highlight = null;
+      _searchEntireDrive = entireDrive;
+    });
+    if (restart) await _startSearch();
+  }
+
+  Future<void> _changeSearchCategory(CloudSearchCategory category) async {
+    if (_searchCategory == category) return;
+    setState(() {
+      _resetSearch();
+      _searchCategory = category;
+    });
+    await _startSearch();
+  }
+
+  void _clearSearch() => setState(() {
+    _resetSearch();
+    _searchCategory = CloudSearchCategory.all;
+    search.clear();
+    highlight = null;
+  });
+
+  Future<void> _rememberSearch(String term) async {
+    try {
+      await _searchHistory.remember(session, term);
+    } catch (_) {
+      if (mounted) message(context, '搜索历史保存失败');
+    }
+  }
+
+  Future<void> _clearSearchHistory() async {
+    if (!await confirm(context, '清空搜索历史', '清空当前账号的搜索记录？', action: '清空') ||
+        !mounted) {
+      return;
+    }
+    await busy(context, () => _searchHistory.clear(session));
+  }
+
+  Future<void> _openSearch() async {
+    if (!allowCloudAction(context, widget.services.control, session.platform)) {
+      return;
+    }
+    try {
+      _checkAccount();
+    } catch (failure) {
+      message(context, errorText(failure));
+      return;
+    }
+    await Navigator.push<void>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => CloudSearchPage(
+          widget.services,
+          session,
+          currentTrail: List.of(stack),
+          currentItems: loading || error.isNotEmpty ? null : List.of(items),
+        ),
+      ),
+    );
+    if (mounted) await _refresh(preserveSelection: true);
+  }
+
+  Future<void> _openSearchDirectory(CloudFile file) async {
+    final trail = [
+      ..._trailFor(file),
+      (widget.services.cloud.directoryId(session, file), file.name),
+    ];
+    final current = _searchGeneration;
+    _deepSearch.stop();
+    await Navigator.push<void>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => BrowserPage(
+          widget.services,
+          session,
+          initialTrail: trail,
+          popAtInitialDirectory: true,
+        ),
+      ),
+    );
+    if (!mounted) return;
+    _deepSearch.clearCache();
+    if (_searchResults && current == _searchGeneration) await _refresh();
+  }
+
+  Future<void> _startSearch({bool refresh = false}) async {
+    if (!_includeSubfolders ||
+        changingAccount ||
+        search.text.trim().isEmpty &&
+            _searchCategory == CloudSearchCategory.all) {
+      return;
+    }
+    FocusScope.of(context).unfocus();
+    unawaited(_rememberSearch(search.text));
+    request?.cancel();
+    _progress.close(cancelled: true);
+    generation++;
+    final current = ++_searchGeneration, captured = session;
+    setState(() {
+      _searchResults = true;
+      selected.clear();
+      _selectionMode = false;
+      loading = false;
+      error = '';
+    });
+    await _deepSearch.start(
+      captured,
+      _searchTrail,
+      search.text,
+      refresh: refresh,
+      matches: _searchCategory == CloudSearchCategory.all
+          ? null
+          : _searchCategory.matches,
+    );
+    if (!mounted || current != _searchGeneration || session != captured) return;
+    final fresh = _deepSearch.cached(captured, stack.last.$1);
+    if (fresh != null) setState(() => items = List.of(fresh));
+  }
+
+  Future<void> _refresh({bool preserveSelection = false}) async {
+    if (_searchResults && _includeSubfolders) {
+      await _startSearch(refresh: true);
+    } else if (!widget.searchPage) {
+      await _load(preserveSelection: preserveSelection);
+    }
+  }
+
+  Future<void> _locate(CloudFile file) async {
+    final hit = _hit(file);
+    if (hit == null) return;
+    final current = _searchGeneration;
+    _deepSearch.stop();
+    await Navigator.push<void>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => BrowserPage(
+          widget.services,
+          session,
+          initialTrail: hit.trail,
+          highlightedFileId: file.id,
+          popAtInitialDirectory: widget.searchPage,
+        ),
+      ),
+    );
+    if (!mounted) return;
+    // Re-read on return: the opened directory may have changed the file.
+    _deepSearch.clearCache();
+    if (_searchResults && current == _searchGeneration) await _refresh();
   }
 
   void _checkAccount() {
@@ -132,16 +399,22 @@ class _BrowserPageState extends State<BrowserPage> {
     return current?.updatedAt == accountRevision ? current : null;
   }
 
-  Future<void> _load() async {
+  Future<void> _load({bool preserveSelection = false}) async {
+    final previousSelection = preserveSelection
+        ? Set<String>.of(selected)
+        : <String>{};
+    _resetSearch(clearCache: true);
     request?.cancel();
     final current = ++generation,
         scope = request = RequestScope(),
         parent = stack.last.$1;
     setState(() {
-      loading = true;
+      loading = !preserveSelection;
       error = '';
-      selected.clear();
-      _selectionMode = false;
+      if (!preserveSelection) {
+        selected.clear();
+        _selectionMode = false;
+      }
     });
     try {
       _checkAccount();
@@ -153,7 +426,21 @@ class _BrowserPageState extends State<BrowserPage> {
       _progress.close();
       setState(() {
         items = files;
+        _deepSearch.remember(session, parent, files);
+        if (highlight != null) {
+          final target = files
+              .where((file) => file.id == highlight)
+              .firstOrNull;
+          search.text = target?.name ?? '';
+          if (target == null) highlight = null;
+        }
         loading = false;
+        if (preserveSelection) {
+          selected.addAll(
+            previousSelection.where((id) => files.any((file) => file.id == id)),
+          );
+          _selectionMode = selected.isNotEmpty;
+        }
       });
     } catch (e) {
       if (!mounted || current != generation) return;
@@ -170,7 +457,15 @@ class _BrowserPageState extends State<BrowserPage> {
     if (!allowCloudAction(context, widget.services.control, session.platform)) {
       return;
     }
-    stack.add((widget.services.cloud.directoryId(session, file), file.name));
+    if (widget.searchPage) {
+      unawaited(_openSearchDirectory(file));
+      return;
+    }
+    final trail = List<(String, String)>.of(_trailFor(file));
+    stack
+      ..clear()
+      ..addAll(trail)
+      ..add((widget.services.cloud.directoryId(session, file), file.name));
     highlight = null;
     search.clear();
     _load();
@@ -180,8 +475,10 @@ class _BrowserPageState extends State<BrowserPage> {
     final display = _display,
         sort = display.sort,
         ascending = display.ascending;
-    final query = search.text.trim().toLowerCase();
-    final result = items
+    final query = _includeSubfolders && !_searchResults
+        ? ''
+        : search.text.trim().toLowerCase();
+    final result = _sourceItems
         .where(
           (f) =>
               f.name.toLowerCase().contains(query) &&
@@ -211,10 +508,30 @@ class _BrowserPageState extends State<BrowserPage> {
   }
 
   Future<void> _download(List<CloudFile> files) async {
+    if (_searchResults) {
+      final directories = files
+          .where((file) => file.isDirectory)
+          .map((file) => widget.services.cloud.directoryId(session, file))
+          .toSet();
+      files = files
+          .where(
+            (file) =>
+                !(_hit(
+                      file,
+                    )?.trail.any((entry) => directories.contains(entry.$1)) ??
+                    false),
+          )
+          .toList();
+    }
+    if (files.any((file) => !_provider.canDownloadFile(session, file))) {
+      message(context, '请进入代码目录或发布附件列表选择下载，也可下载仓库源码 ZIP');
+      return;
+    }
     if (!await confirmBaiduDownload(
           context,
           widget.services,
           session.platform,
+          session: session,
         ) ||
         !mounted) {
       return;
@@ -224,12 +541,18 @@ class _BrowserPageState extends State<BrowserPage> {
       final collected = await widget.services.cloud.collect(session, files);
       _checkAccount();
       if (collected.isEmpty) return 0;
-      final specs = [
-        for (final item in collected)
+      final specs = <DownloadSpec>[];
+      for (final item in collected) {
+        if (specs.isNotEmpty && specs.length % 128 == 0) {
+          await RequestScope.wait(Duration.zero);
+          _checkAccount();
+        }
+        specs.add(
           widget.services.cloud
               .planDownload(session, item.$1)
               .copyWith(relativePath: item.$2),
-      ];
+        );
+      }
       final ids = await widget.services.downloads.enqueueAll(specs);
       return ids.length;
     }, label: '正在添加下载任务…');
@@ -246,7 +569,20 @@ class _BrowserPageState extends State<BrowserPage> {
   Future<String?> _destination(List<CloudFile> files) async {
     final personal = await busy(
       context,
-      () => session.mode == BrowseMode.personal
+      () => session.platform == CloudPlatform.github
+          ? Future.value(
+              BrowseSession(
+                platform: session.platform,
+                mode: session.mode,
+                title:
+                    '${GitHubLocation.parse(files.first.id).repository} · ${GitHubLocation.parse(files.first.id).ref}',
+                rootId: GitHubLocation.parse(
+                  files.first.id,
+                ).copy(kind: GitHubNodeKind.code, path: '').id,
+                metadata: session.metadata,
+              ),
+            )
+          : session.mode == BrowseMode.personal
           ? widget.services.cloud.reopenSpace(session)
           : widget.services.cloud.personal(
               session.platform,
@@ -278,11 +614,30 @@ class _BrowserPageState extends State<BrowserPage> {
     if (!allowCloudAction(context, widget.services.control, session.platform)) {
       return;
     }
+    _deepSearch.stop();
     final connector = widget.services.cloud.connector(session.platform);
+    if (action == 'locate') {
+      await _locate(files.first);
+      return;
+    }
+    final allowed = switch (action) {
+      'rename' => files.every((f) => connector.canRenameFile(session, f)),
+      'delete' => files.every((f) => connector.canDeleteFile(session, f)),
+      'move' => files.every((f) => connector.canMoveFile(session, f)),
+      _ => true,
+    };
+    if (!allowed) {
+      message(context, '当前项目只读，请选择可管理的文件');
+      return;
+    }
     if (action == 'favorite') {
       final saved = await busy(context, () async {
         _checkAccount();
-        return widget.services.favorites.toggle(session, files.first, stack);
+        return widget.services.favorites.toggle(
+          session,
+          files.first,
+          _trailFor(files.first),
+        );
       });
       if (mounted && saved != null) {
         setState(() {});
@@ -296,6 +651,7 @@ class _BrowserPageState extends State<BrowserPage> {
     }
     if (action == 'preview') {
       _checkAccount();
+      _deepSearch.stop();
       await Navigator.push<void>(
         context,
         MaterialPageRoute(
@@ -304,6 +660,10 @@ class _BrowserPageState extends State<BrowserPage> {
             session,
             files.first,
             playlist: displayed,
+            parentFolders: {
+              for (final file in {...displayed, files.first})
+                file.id: _trailFor(file).last.$1,
+            },
           ),
         ),
       );
@@ -333,8 +693,10 @@ class _BrowserPageState extends State<BrowserPage> {
     if (action == 'delete') {
       if (!await confirm(
             context,
-            '删除网盘文件',
-            '确认删除选中的 ${files.length} 项？\n${files.take(3).map((f) => f.name).join('\n')}',
+            session.platform == CloudPlatform.github
+                ? '删除 GitHub 文件'
+                : '删除网盘文件',
+            '${session.platform == CloudPlatform.github ? '代码文件会从当前分支删除；发布附件会被永久删除。\n' : ''}确认删除选中的 ${files.length} 项？\n${files.take(3).map((f) => f.name).join('\n')}',
             action: '删除',
             destructive: true,
           ) ||
@@ -401,7 +763,7 @@ class _BrowserPageState extends State<BrowserPage> {
       );
     } else if (result == true) {
       message(context, action == 'save' ? '转存完成' : '操作完成');
-      await _load();
+      await _refresh();
     }
   }
 
@@ -419,6 +781,12 @@ class _BrowserPageState extends State<BrowserPage> {
                 title: Text(file.name, maxLines: 2),
                 subtitle: _fileMetadata(file),
               ),
+              if (_hit(file) != null)
+                ListTile(
+                  leading: const Icon(CupertinoIcons.folder),
+                  title: const Text('打开所在文件夹'),
+                  onTap: () => Navigator.pop(context, 'locate'),
+                ),
               if (!file.isDirectory)
                 ListTile(
                   leading: const Icon(CupertinoIcons.eye),
@@ -439,11 +807,12 @@ class _BrowserPageState extends State<BrowserPage> {
                 ),
                 onTap: () => Navigator.pop(context, 'favorite'),
               ),
-              ListTile(
-                leading: const Icon(CupertinoIcons.arrow_down_circle),
-                title: const Text('下载'),
-                onTap: () => Navigator.pop(context, 'download'),
-              ),
+              if (_provider.canDownloadFile(session, file))
+                ListTile(
+                  leading: const Icon(CupertinoIcons.arrow_down_circle),
+                  title: const Text('下载'),
+                  onTap: () => Navigator.pop(context, 'download'),
+                ),
               if (!file.isDirectory)
                 ListTile(
                   leading: const Icon(CupertinoIcons.link),
@@ -461,27 +830,36 @@ class _BrowserPageState extends State<BrowserPage> {
                   onTap: () => Navigator.pop(context, 'save'),
                 )
               else if (session.canManageFiles) ...[
-                ListTile(
-                  leading: const Icon(CupertinoIcons.pencil),
-                  title: const Text('重命名'),
-                  onTap: () => Navigator.pop(context, 'rename'),
-                ),
-                ListTile(
-                  leading: const Icon(CupertinoIcons.folder),
-                  title: const Text('移动'),
-                  onTap: () => Navigator.pop(context, 'move'),
-                ),
+                if (_provider.canRenameFile(session, file))
+                  ListTile(
+                    leading: const Icon(CupertinoIcons.pencil),
+                    title: const Text('重命名'),
+                    onTap: () => Navigator.pop(context, 'rename'),
+                  ),
+                if (_provider.canMoveFile(session, file))
+                  ListTile(
+                    leading: const Icon(CupertinoIcons.folder),
+                    title: const Text('移动'),
+                    onTap: () => Navigator.pop(context, 'move'),
+                  ),
                 if (session.platform.supportsSharing)
                   ListTile(
                     leading: const Icon(CupertinoIcons.share),
                     title: const Text('创建分享'),
                     onTap: () => Navigator.pop(context, 'share'),
                   ),
-                ListTile(
-                  leading: const Icon(CupertinoIcons.trash, color: Colors.red),
-                  title: const Text('删除', style: TextStyle(color: Colors.red)),
-                  onTap: () => Navigator.pop(context, 'delete'),
-                ),
+                if (_provider.canDeleteFile(session, file))
+                  ListTile(
+                    leading: const Icon(
+                      CupertinoIcons.trash,
+                      color: Colors.red,
+                    ),
+                    title: const Text(
+                      '删除',
+                      style: TextStyle(color: Colors.red),
+                    ),
+                    onTap: () => Navigator.pop(context, 'delete'),
+                  ),
               ],
             ],
           ),
@@ -495,7 +873,14 @@ class _BrowserPageState extends State<BrowserPage> {
     if (!allowCloudAction(context, widget.services.control, session.platform)) {
       return;
     }
-    final name = await askText(context, '新建文件夹', hint: '文件夹名称');
+    if (!_canCreateFolder) return;
+    final name = await askText(
+      context,
+      '新建文件夹',
+      hint: session.platform == CloudPlatform.github
+          ? '文件夹名称（保留 .gitkeep 占位文件）'
+          : '文件夹名称',
+    );
     if (name == null || name.trim().isEmpty || !mounted) return;
     final result = await busy(context, () async {
       _checkAccount();
@@ -505,11 +890,11 @@ class _BrowserPageState extends State<BrowserPage> {
         name.trim(),
       );
     });
-    if (result != null && mounted) await _load();
+    if (result != null && mounted) await _refresh();
   }
 
   Future<void> _upload() async {
-    if (pickingUpload) return;
+    if (pickingUpload || !_canUpload) return;
     if (!allowCloudAction(context, widget.services.control, session.platform)) {
       return;
     }
@@ -544,17 +929,19 @@ class _BrowserPageState extends State<BrowserPage> {
         throw const AppException('账号或网盘已变化，请重新选择上传文件');
       }
       _checkAccount();
-      await showDialog<void>(
-        context: context,
-        barrierDismissible: false,
-        builder: (_) => CloudUploadDialog(
-          cloud: widget.services.cloud,
-          session: activeSession,
-          parent: parent,
-          files: files,
-        ),
+      final ids = await widget.services.uploads.enqueue(
+        activeSession,
+        parent,
+        stack.last.$2,
+        files,
       );
-      if (mounted) await _load();
+      if (mounted && ids.isNotEmpty) {
+        message(
+          context,
+          '已添加 ${ids.length} 个上传任务，可离开页面 · 查看',
+          onTap: widget.services.requestUploadManager,
+        );
+      }
     } catch (error) {
       if (mounted) message(context, errorText(error));
     } finally {
@@ -562,8 +949,40 @@ class _BrowserPageState extends State<BrowserPage> {
     }
   }
 
-  Future<void> _accountAction(String action) async {
+  Future<void> _accountAction(String action, {String? sourceAccountId}) async {
     if (changingAccount) return;
+    final owner =
+        sourceAccountId ??
+        session.accountId ??
+        widget.services.vault.activeAccountId(session.platform);
+    if (action == 'info') {
+      await openCloudAccountInfo(
+        context,
+        widget.services.vault,
+        session.platform,
+        owner,
+      );
+      return;
+    }
+    if (action == 'copyLogin') {
+      await copyCloudAccountLoginInfo(
+        context,
+        widget.services.vault,
+        session.platform,
+        owner,
+      );
+      return;
+    }
+    if (action == 'accounts') {
+      await Navigator.push<void>(
+        context,
+        MaterialPageRoute(
+          builder: (_) =>
+              CloudAccountsPage(widget.services, platform: session.platform),
+        ),
+      );
+      return;
+    }
     if (!allowCloudAction(context, widget.services.control, session.platform)) {
       return;
     }
@@ -597,6 +1016,63 @@ class _BrowserPageState extends State<BrowserPage> {
     }
   }
 
+  Widget _accountMenu() => AnimatedBuilder(
+    animation: widget.services.store,
+    builder: (context, _) {
+      final vault = widget.services.vault;
+      final owner =
+          session.accountId ?? vault.activeAccountId(session.platform);
+      final credential = vault.credentialFor(session.platform, owner);
+      final info = savedAccountLoginInfo(vault, session.platform, owner);
+      return IgnorePointer(
+        ignoring: changingAccount,
+        child: AppPopupMenuButton<String>(
+          key: const Key('browser-account-menu'),
+          tooltip: '切换或更新账号',
+          label: '账号',
+          icon: CupertinoIcons.person_crop_circle,
+          onSelected: (action) =>
+              _accountAction(action, sourceAccountId: owner),
+          actions: [
+            const AppMenuAction(
+              value: 'info',
+              label: '账号配置',
+              icon: CupertinoIcons.slider_horizontal_3,
+            ),
+            if (credential != null)
+              AppMenuAction(
+                value: 'copyLogin',
+                label: info.copyLabel,
+                icon: CupertinoIcons.doc_on_doc,
+              ),
+            for (final account in vault.profiles(session.platform))
+              AppMenuAction(
+                value: 'account:${account.id}',
+                label: account.name,
+                icon: CupertinoIcons.person,
+                selected: account.id == session.accountId,
+              ),
+            const AppMenuAction(
+              value: 'login',
+              label: '更新当前账号',
+              icon: CupertinoIcons.arrow_clockwise,
+            ),
+            const AppMenuAction(
+              value: 'add',
+              label: '添加账号',
+              icon: CupertinoIcons.person_badge_plus,
+            ),
+            const AppMenuAction(
+              value: 'accounts',
+              label: '多账号管理',
+              icon: CupertinoIcons.person_2,
+            ),
+          ],
+        ),
+      );
+    },
+  );
+
   Future<(BrowseSession, List<CloudFile>, int?)> _readAccountSession(
     String owner, {
     bool keepSpace = false,
@@ -606,7 +1082,10 @@ class _BrowserPageState extends State<BrowserPage> {
       if (previous.mode == BrowseMode.share) {
         final link = previous.sourceLink;
         require(link != null, '原分享信息缺失，请返回首页重新解析');
-        return widget.services.cloud.share(link!);
+        return widget.services.cloud.share(
+          link!,
+          baiduRoute: BaiduShareRoute.fromSession(previous),
+        );
       }
       return keepSpace
           ? widget.services.cloud.reopenSpace(previous)
@@ -640,6 +1119,44 @@ class _BrowserPageState extends State<BrowserPage> {
       await _replaceSession(result.$1, initialItems: result.$2);
     } catch (error) {
       if (mounted) message(context, errorText(error));
+    }
+  }
+
+  Future<void> _switchBaiduRoute(BaiduShareRoute route) async {
+    if (changingAccount || route == BaiduShareRoute.fromSession(session)) {
+      return;
+    }
+    setState(() => changingAccount = true);
+    try {
+      if (route == BaiduShareRoute.account &&
+          widget.services.cloud.sessionCredential(session) == null) {
+        await _login();
+        if (!mounted ||
+            widget.services.cloud.sessionCredential(session) == null) {
+          return;
+        }
+      }
+      final previous = session, link = session.sourceLink;
+      if (link == null) return;
+      final result = await busy<(BrowseSession, List<CloudFile>)>(
+        context,
+        () => widget.services.cloud.withSession(previous, () async {
+          _checkAccount();
+          final next = await widget.services.cloud.share(
+            link,
+            baiduRoute: route,
+          );
+          final files = await widget.services.cloud.list(next, next.rootId);
+          _checkAccount();
+          return (next, files);
+        }),
+        label: '正在切换解析方式…',
+      );
+      if (result != null && mounted && session == previous) {
+        await _replaceSession(result.$1, initialItems: result.$2);
+      }
+    } finally {
+      if (mounted) setState(() => changingAccount = false);
     }
   }
 
@@ -678,6 +1195,7 @@ class _BrowserPageState extends State<BrowserPage> {
     BrowseSession value, {
     List<CloudFile>? initialItems,
   }) async {
+    _resetSearch(clearCache: true);
     request?.cancel();
     generation++;
     setState(() {
@@ -695,6 +1213,9 @@ class _BrowserPageState extends State<BrowserPage> {
       _selectionMode = false;
       error = '';
       loading = initialItems == null;
+      if (initialItems != null) {
+        _deepSearch.remember(session, stack.last.$1, items);
+      }
     });
     if (initialItems == null) await _load();
   }
@@ -756,10 +1277,12 @@ class _BrowserPageState extends State<BrowserPage> {
                         borderRadius: BorderRadius.circular(12),
                       ),
                       selected: active,
-                      selectedTileColor: brandBlue.withValues(alpha: .07),
-                      leading: const Icon(
+                      selectedTileColor: themeAccent(
+                        context,
+                      ).withValues(alpha: .07),
+                      leading: Icon(
                         CupertinoIcons.person_2,
-                        color: brandBlue,
+                        color: themeAccent(context),
                       ),
                       title: Text(
                         space.name,
@@ -767,9 +1290,9 @@ class _BrowserPageState extends State<BrowserPage> {
                         overflow: TextOverflow.ellipsis,
                       ),
                       trailing: active
-                          ? const Icon(
+                          ? Icon(
                               CupertinoIcons.checkmark,
-                              color: brandBlue,
+                              color: themeAccent(context),
                               size: 18,
                             )
                           : null,
@@ -821,11 +1344,17 @@ class _BrowserPageState extends State<BrowserPage> {
             ),
             for (final space in spaces)
               ListTile(
-                leading: const Icon(CupertinoIcons.cloud, color: brandBlue),
+                leading: Icon(
+                  CupertinoIcons.cloud,
+                  color: themeAccent(context),
+                ),
                 title: Text(space.name),
                 selected: space.id == session.personalSpaceId,
                 trailing: space.id == session.personalSpaceId
-                    ? const Icon(CupertinoIcons.checkmark, color: brandBlue)
+                    ? Icon(
+                        CupertinoIcons.checkmark,
+                        color: themeAccent(context),
+                      )
                     : null,
                 onTap: () => Navigator.pop(context, space),
               ),
@@ -888,7 +1417,7 @@ class _BrowserPageState extends State<BrowserPage> {
                   key: ValueKey(family ? 'family-space' : 'personal-space'),
                   style: TextButton.styleFrom(
                     foregroundColor: family == session.isFamily
-                        ? brandBlue
+                        ? themeAccent(context)
                         : secondary(context),
                     backgroundColor: family == session.isFamily
                         ? Theme.of(context).colorScheme.surface
@@ -946,7 +1475,8 @@ class _BrowserPageState extends State<BrowserPage> {
 
   void _toggle(CloudFile file) => setState(() {
     _selectionMode = true;
-    if (!selected.add(file.id)) selected.remove(file.id);
+    final key = _fileKey(file);
+    if (!selected.add(key)) selected.remove(key);
   });
 
   void _finishSelection() => setState(() {
@@ -955,14 +1485,15 @@ class _BrowserPageState extends State<BrowserPage> {
   });
 
   bool _allVisibleSelected(List<CloudFile> files) =>
-      files.isNotEmpty && files.every((file) => selected.contains(file.id));
+      files.isNotEmpty &&
+      files.every((file) => selected.contains(_fileKey(file)));
 
   void _toggleAllVisible(List<CloudFile> files) => setState(() {
     _selectionMode = true;
     if (_allVisibleSelected(files)) {
-      selected.removeAll(files.map((file) => file.id));
+      selected.removeAll(files.map(_fileKey));
     } else {
-      selected.addAll(files.map((file) => file.id));
+      selected.addAll(files.map(_fileKey));
     }
   });
 
@@ -978,7 +1509,7 @@ class _BrowserPageState extends State<BrowserPage> {
 
   Widget _fileList(List<CloudFile> files, BoxConstraints constraints) {
     final key = ValueKey(
-      '${session.platform.name}:${session.mode.name}:${session.familyId}:${session.personalSpaceId}:${stack.last.$1}:$view',
+      '${session.platform.name}:${session.mode.name}:${session.familyId}:${session.personalSpaceId}:${stack.last.$1}:$view:${_searchResults ? _searchGeneration : 0}',
     );
     if (view == 'grid' && !widget.picking) {
       final columns = ((constraints.maxWidth - 20) / 180).round().clamp(1, 8);
@@ -1003,6 +1534,7 @@ class _BrowserPageState extends State<BrowserPage> {
               titleHeight +
               scaler.scale(11) * 1.3 +
               timeHeight +
+              (_searchResults ? scaler.scale(11) * 1.3 * 2 + 4 : 0) +
               30,
         ),
         itemCount: files.length,
@@ -1025,14 +1557,15 @@ class _BrowserPageState extends State<BrowserPage> {
   }
 
   Widget _listRow(CloudFile file, bool wide) {
-    final checked = selected.contains(file.id);
+    final checked = selected.contains(_fileKey(file));
     return GestureDetector(
       onSecondaryTap: widget.picking ? null : () => _menu(file),
       child: ListTile(
+        key: ValueKey('browser-file-${_fileKey(file)}'),
         dense: true,
         minVerticalPadding: 11,
         selected: checked || file.id == highlight,
-        selectedTileColor: brandBlue.withValues(alpha: .07),
+        selectedTileColor: themeAccent(context).withValues(alpha: .07),
         leading: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -1045,12 +1578,14 @@ class _BrowserPageState extends State<BrowserPage> {
             ),
           ],
         ),
-        title: Text(
-          file.name,
-          maxLines: 2,
-          overflow: TextOverflow.ellipsis,
-          style: const TextStyle(fontSize: 14),
-        ),
+        title: widget.searchPage
+            ? CloudSearchFileName(file.name, search.text)
+            : Text(
+                file.name,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontSize: 14),
+              ),
         subtitle: _fileMetadata(file),
         trailing: widget.picking
             ? const Icon(CupertinoIcons.chevron_right, size: 14)
@@ -1072,21 +1607,22 @@ class _BrowserPageState extends State<BrowserPage> {
     double titleHeight,
     bool wide,
   ) {
-    final checked = selected.contains(file.id);
+    final checked = selected.contains(_fileKey(file));
     final time = formatCloudFileTime(file.modifiedAt);
     return Semantics(
+      key: ValueKey('browser-file-${_fileKey(file)}'),
       selected: checked,
       child: GestureDetector(
         onSecondaryTap: () => _menu(file),
         child: Material(
           color: checked || file.id == highlight
-              ? brandBlue.withValues(alpha: .07)
+              ? themeAccent(context).withValues(alpha: .07)
               : Theme.of(context).colorScheme.surface,
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(14),
             side: BorderSide(
               color: checked
-                  ? brandBlue
+                  ? themeAccent(context)
                   : border(context).withValues(alpha: .7),
             ),
           ),
@@ -1185,6 +1721,19 @@ class _BrowserPageState extends State<BrowserPage> {
                       ),
                     ),
                   ],
+                  if (_hit(file) case final hit?) ...[
+                    const SizedBox(height: 4),
+                    Text(
+                      hit.path,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 11,
+                        height: 1.3,
+                        color: secondary(context),
+                      ),
+                    ),
+                  ],
                 ],
               ),
             ),
@@ -1197,12 +1746,30 @@ class _BrowserPageState extends State<BrowserPage> {
   Widget _fileMetadata(CloudFile file) {
     final time = formatCloudFileTime(file.modifiedAt);
     final style = TextStyle(fontSize: 11, color: secondary(context));
-    return Wrap(
-      spacing: 10,
-      runSpacing: 2,
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(file.isDirectory ? '文件夹' : formatBytes(file.size), style: style),
-        if (time.isNotEmpty) Text(time, style: style),
+        Wrap(
+          spacing: 10,
+          runSpacing: 2,
+          children: [
+            Text(
+              file.isDirectory ? '文件夹' : formatBytes(file.size),
+              style: style,
+            ),
+            if (time.isNotEmpty) Text(time, style: style),
+          ],
+        ),
+        if (_hit(file) case final hit?)
+          Padding(
+            padding: const EdgeInsets.only(top: 3),
+            child: Text(
+              hit.path,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: style,
+            ),
+          ),
       ],
     );
   }
@@ -1211,28 +1778,63 @@ class _BrowserPageState extends State<BrowserPage> {
     padding: const EdgeInsets.fromLTRB(16, 0, 8, 10),
     child: LayoutBuilder(
       builder: (context, constraints) {
-        final field = TextField(
-          controller: search,
-          onChanged: (_) => setState(() {}),
-          decoration: InputDecoration(
-            hintText: '搜索当前文件夹',
-            prefixIcon: const Icon(CupertinoIcons.search, size: 18),
-            suffixIcon: search.text.isEmpty
-                ? null
-                : IconButton(
-                    tooltip: '清除搜索，显示全部文件',
-                    icon: const Icon(
-                      CupertinoIcons.xmark_circle_fill,
-                      size: 18,
-                    ),
-                    onPressed: () => setState(() {
-                      search.clear();
-                      highlight = null;
-                    }),
-                  ),
-            isDense: true,
-          ),
-        );
+        final field =
+            !widget.picking && highlight == null && search.text.isEmpty
+            ? CloudSearchEntry(onTap: changingAccount ? null : _openSearch)
+            : TextField(
+                key: const Key('browser-search-input'),
+                controller: search,
+                textInputAction: TextInputAction.search,
+                onChanged: (_) => _editSearch(),
+                onSubmitted: (_) {
+                  if (_includeSubfolders) {
+                    FocusScope.of(context).unfocus();
+                    unawaited(_startSearch());
+                  }
+                },
+                decoration: InputDecoration(
+                  hintText: _includeSubfolders ? '搜索文件及子文件夹' : '搜索当前文件夹',
+                  prefixIcon: const Icon(CupertinoIcons.search, size: 18),
+                  suffixIcon: search.text.isEmpty && !_includeSubfolders
+                      ? null
+                      : Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            if (search.text.isNotEmpty)
+                              IconButton(
+                                tooltip: '清除搜索，显示全部文件',
+                                icon: const Icon(
+                                  CupertinoIcons.xmark_circle_fill,
+                                  size: 18,
+                                ),
+                                onPressed: () => setState(() {
+                                  _resetSearch();
+                                  search.clear();
+                                  highlight = null;
+                                }),
+                              ),
+                            if (_includeSubfolders)
+                              IconButton(
+                                key: const Key('browser-search-submit'),
+                                tooltip: '搜索子文件夹',
+                                color: themeAccent(context),
+                                icon: const Icon(
+                                  CupertinoIcons.arrow_right_circle_fill,
+                                ),
+                                onPressed:
+                                    search.text.trim().isEmpty ||
+                                        changingAccount
+                                    ? null
+                                    : () {
+                                        FocusScope.of(context).unfocus();
+                                        unawaited(_startSearch());
+                                      },
+                              ),
+                          ],
+                        ),
+                  isDense: true,
+                ),
+              );
         final controls = Row(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -1294,7 +1896,7 @@ class _BrowserPageState extends State<BrowserPage> {
                         ? null
                         : () => setState(() => _selectionMode = true),
                     style: FilledButton.styleFrom(
-                      backgroundColor: brandBlue,
+                      backgroundColor: themeAccent(context),
                       foregroundColor: Colors.white,
                       minimumSize: const Size(0, 40),
                       padding: const EdgeInsets.symmetric(horizontal: 14),
@@ -1341,6 +1943,7 @@ class _BrowserPageState extends State<BrowserPage> {
         return Row(
           children: [
             Expanded(child: field),
+            const SizedBox(width: 8),
             controls,
           ],
         );
@@ -1348,11 +1951,375 @@ class _BrowserPageState extends State<BrowserPage> {
     ),
   );
 
+  Widget _searchSummary() {
+    final phase = _deepSearch.phase;
+    final count = _deepSearch.hits.length;
+    if (!_searchResults) {
+      return Padding(
+        padding: const EdgeInsets.fromLTRB(20, 0, 20, 10),
+        child: Align(
+          alignment: Alignment.centerLeft,
+          child: Text(
+            '点击搜索按钮，查找当前文件夹及其子文件夹',
+            style: TextStyle(fontSize: 12, color: secondary(context)),
+          ),
+        ),
+      );
+    }
+    final title = switch (phase) {
+      CloudSearchPhase.running => '正在搜索 · 已找到 $count 项',
+      CloudSearchPhase.completed => '搜索完成 · 共 $count 项',
+      CloudSearchPhase.partial => '部分文件夹未能读取 · 找到 $count 项',
+      CloudSearchPhase.stopped => '已停止搜索 · 保留 $count 项',
+      CloudSearchPhase.limited => '已到搜索上限 · 找到 $count 项',
+      CloudSearchPhase.failed => '搜索中断 · 保留 $count 项',
+      CloudSearchPhase.idle => '准备搜索',
+    };
+    final detail = switch (phase) {
+      CloudSearchPhase.limited => '文件较多，请进入更具体的文件夹后搜索',
+      CloudSearchPhase.failed => _deepSearch.error,
+      CloudSearchPhase.partial =>
+        '${_deepSearch.failedFolders} 个文件夹未能读取，结果可能不完整',
+      CloudSearchPhase.stopped => '结果可能不完整，可重新搜索',
+      _ => '已检查 ${_deepSearch.searchedFolders} 个文件夹',
+    };
+    return Container(
+      key: const Key('browser-search-status'),
+      padding: const EdgeInsets.fromLTRB(20, 5, 6, 5),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: const TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                if (phase != CloudSearchPhase.completed) ...[
+                  const SizedBox(height: 3),
+                  Text(
+                    detail,
+                    maxLines: 3,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(fontSize: 11, color: secondary(context)),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          if (_deepSearch.issues.isNotEmpty || _deepSearch.error.isNotEmpty)
+            IconButton(
+              key: const Key('browser-search-issues'),
+              tooltip: '查看搜索问题',
+              icon: const Icon(CupertinoIcons.info_circle, size: 19),
+              onPressed: _showSearchIssues,
+            ),
+          IconButton(
+            key: const Key('browser-search-action'),
+            tooltip: _deepSearch.running ? '停止搜索' : '重新搜索',
+            color: themeAccent(context),
+            icon: Icon(
+              _deepSearch.running
+                  ? CupertinoIcons.stop_circle
+                  : CupertinoIcons.arrow_clockwise,
+              size: 21,
+            ),
+            onPressed: _deepSearch.running
+                ? _deepSearch.stop
+                : () => unawaited(_startSearch(refresh: true)),
+          ),
+          SizedBox(
+            width: 38,
+            child: AppPopupMenuButton<String>(
+              tooltip: '排序',
+              icon: CupertinoIcons.sort_down,
+              onSelected: _changeSort,
+              actions: [
+                for (final option in [
+                  ('name', '名称', CupertinoIcons.textformat_abc),
+                  ('date', '时间', CupertinoIcons.clock),
+                  ('size', '大小', CupertinoIcons.doc),
+                ])
+                  AppMenuAction(
+                    value: option.$1,
+                    label: option.$2,
+                    icon: option.$3,
+                    selected: sort == option.$1,
+                    detail: sort == option.$1
+                        ? ascending
+                              ? '↑ 升序'
+                              : '↓ 降序'
+                        : null,
+                  ),
+              ],
+            ),
+          ),
+          TextButton(
+            key: const Key('browser-multi-select'),
+            onPressed: _selecting
+                ? _finishSelection
+                : displayed.isEmpty
+                ? null
+                : () => setState(() => _selectionMode = true),
+            style: TextButton.styleFrom(
+              minimumSize: const Size(40, 40),
+              padding: const EdgeInsets.symmetric(horizontal: 9),
+            ),
+            child: Text(
+              _selecting ? '完成' : '多选',
+              style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _showSearchIssues() async {
+    final issues = _deepSearch.issues.toList();
+    final failure = _deepSearch.error;
+    final failedFolders = _deepSearch.failedFolders;
+    await showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('搜索未完成的原因'),
+        content: SizedBox(
+          width: 400,
+          child: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (failure.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 12),
+                    child: Text(failure),
+                  ),
+                for (final issue in issues)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 12),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(issue.path, style: const TextStyle(fontSize: 13)),
+                        const SizedBox(height: 4),
+                        Text(
+                          issue.message,
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: secondary(context),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                if (failedFolders > issues.length)
+                  Text('另有 ${failedFolders - issues.length} 个文件夹未能读取'),
+                const Text('已找到的文件仍可使用，修复网络或登录问题后可重新搜索。'),
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('关闭'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _githubContext() {
+    final n = GitHubLocation.tryParse(stack.last.$1);
+    if (n == null || n.repo.isEmpty) return const SizedBox.shrink();
+    final description = switch (n.kind) {
+      GitHubNodeKind.code || GitHubNodeKind.file =>
+        '${n.branch ? '分支' : '标签 / 提交'}：${n.ref} · ${_canUpload ? '可编辑' : '只读'}',
+      GitHubNodeKind.release || GitHubNodeKind.asset => '发布附件 · ${n.ref}',
+      _ => '代码仓库与发布附件',
+    };
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        decoration: BoxDecoration(
+          color: fill(context),
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              n.repository,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
+            ),
+            const SizedBox(height: 3),
+            Text(
+              description,
+              style: TextStyle(fontSize: 12, color: secondary(context)),
+            ),
+            if (_canUpload) ...[
+              const SizedBox(height: 3),
+              Text(
+                n.kind == GitHubNodeKind.release
+                    ? '上传到此发布，单个附件最多 2 GiB'
+                    : '修改将保存到此分支。代码文件最多 100 MiB，大文件可放到 Releases。',
+                style: TextStyle(
+                  fontSize: 11,
+                  height: 1.4,
+                  color: secondary(context),
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSearchPage() {
+    final files = displayed;
+    final selection = _sourceItems
+        .where((file) => selected.contains(_fileKey(file)))
+        .toList();
+    return PopScope(
+      canPop: !_selecting,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop && _selecting) _finishSelection();
+      },
+      child: CloudSearchLayout(
+        platform: session.platform,
+        controller: search,
+        onChanged: (_) => _editSearch(),
+        onSubmit: () => unawaited(_startSearch()),
+        onClear: _clearSearch,
+        onBack: () {
+          Navigator.maybePop(context);
+        },
+        category: _searchCategory,
+        onCategory: (value) => unawaited(_changeSearchCategory(value)),
+        entireDrive: _searchEntireDrive,
+        onScope: (value) => unawaited(_changeSearchScope(value)),
+        currentFolder: stack.last.$2,
+        resultHeader: !_searchResults
+            ? null
+            : Column(
+                children: [
+                  if (_deepSearch.running)
+                    const LinearProgressIndicator(minHeight: 2),
+                  _searchSummary(),
+                ],
+              ),
+        footer: !_selecting
+            ? null
+            : Container(
+                decoration: BoxDecoration(
+                  color: Theme.of(context).colorScheme.surface,
+                  border: Border(
+                    top: BorderSide(color: border(context), width: .6),
+                  ),
+                ),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 8,
+                ),
+                child: Wrap(
+                  alignment: WrapAlignment.spaceBetween,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  spacing: 12,
+                  runSpacing: 8,
+                  children: [
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        TextButton(
+                          onPressed: files.isEmpty
+                              ? null
+                              : () => _toggleAllVisible(files),
+                          child: Text(
+                            _allVisibleSelected(files) ? '取消全选' : '全选',
+                          ),
+                        ),
+                        Text(
+                          '已选 ${selection.length} 项',
+                          style: const TextStyle(fontSize: 12),
+                        ),
+                      ],
+                    ),
+                    FilledButton.icon(
+                      onPressed:
+                          selection.isEmpty ||
+                              selection.any(
+                                (file) =>
+                                    !_provider.canDownloadFile(session, file),
+                              )
+                          ? null
+                          : () => _operate('download', selection),
+                      icon: const Icon(CupertinoIcons.arrow_down, size: 17),
+                      label: const Text('下载'),
+                    ),
+                  ],
+                ),
+              ),
+        child: error.isNotEmpty
+            ? EmptyPanel(
+                '搜索暂不可用',
+                error,
+                action: TextButton(
+                  onPressed: () => Navigator.maybePop(context),
+                  child: const Text('返回文件列表'),
+                ),
+              )
+            : !_searchResults
+            ? CloudSearchLanding(
+                history: _searchHistory.read(session),
+                onSearch: (term) {
+                  search.text = term;
+                  unawaited(_startSearch());
+                },
+                onClear: () => unawaited(_clearSearchHistory()),
+                onRemove: (term) => unawaited(
+                  busy(context, () => _searchHistory.remove(session, term)),
+                ),
+              )
+            : files.isEmpty
+            ? EmptyPanel(
+                _deepSearch.running ? '正在查找文件…' : '暂未找到匹配的文件',
+                _deepSearch.running
+                    ? '找到的文件会陆续显示在这里'
+                    : _deepSearch.phase == CloudSearchPhase.completed
+                    ? '试试其他关键词、文件类型或搜索范围'
+                    : '结果可能不完整，可以重新搜索或查看搜索问题',
+                icon: CupertinoIcons.search,
+              )
+            : RefreshIndicator(
+                onRefresh: _refresh,
+                child: LayoutBuilder(
+                  builder: (context, constraints) =>
+                      _fileList(files, constraints),
+                ),
+              ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     if (!widget.services.control.cloudEnabled(session.platform)) {
       return PageFrame(
         title: session.platform.label,
+        actions: [
+          if (!widget.picking && session.platform.requiresAccount)
+            _accountMenu(),
+        ],
         child: EmptyPanel(
           '网盘暂时停用',
           widget.services.control.config
@@ -1362,14 +2329,27 @@ class _BrowserPageState extends State<BrowserPage> {
         ),
       );
     }
+    if (widget.searchPage) return _buildSearchPage();
     final files = displayed,
-        selection = items.where((f) => selected.contains(f.id)).toList();
+        selection = _sourceItems
+            .where((f) => selected.contains(_fileKey(f)))
+            .toList();
     return PopScope(
-      canPop: stack.length == 1 && !_selecting,
+      canPop:
+          (stack.length == 1 ||
+              widget.popAtInitialDirectory &&
+                  stack.length <= (widget.initialTrail?.length ?? 1)) &&
+          !_selecting &&
+          !_searchResults,
       onPopInvokedWithResult: (didPop, _) {
         if (didPop) return;
         if (_selecting) {
           _finishSelection();
+        } else if (_searchResults) {
+          setState(() {
+            _resetSearch();
+            search.clear();
+          });
         } else if (stack.length > 1) {
           stack.removeLast();
           _load();
@@ -1429,56 +2409,21 @@ class _BrowserPageState extends State<BrowserPage> {
                 ),
               ),
             ),
-          if (!widget.picking &&
-              session.platform.requiresAccount &&
-              (session.mode == BrowseMode.personal ||
-                  session.platform != CloudPlatform.lanzou))
-            AnimatedBuilder(
-              animation: widget.services.store,
-              builder: (context, _) => IgnorePointer(
-                ignoring: changingAccount,
-                child: AppPopupMenuButton<String>(
-                  key: const Key('browser-account-menu'),
-                  tooltip: '切换或更新账号',
-                  icon: CupertinoIcons.person_crop_circle,
-                  onSelected: _accountAction,
-                  actions: [
-                    for (final account in widget.services.vault.profiles(
-                      session.platform,
-                    ))
-                      AppMenuAction(
-                        value: 'account:${account.id}',
-                        label: account.name,
-                        icon: CupertinoIcons.person,
-                        selected: account.id == session.accountId,
-                      ),
-                    const AppMenuAction(
-                      value: 'login',
-                      label: '更新当前账号',
-                      icon: CupertinoIcons.arrow_clockwise,
-                    ),
-                    const AppMenuAction(
-                      value: 'add',
-                      label: '添加账号',
-                      icon: CupertinoIcons.person_badge_plus,
-                    ),
-                  ],
-                ),
-              ),
-            ),
+          if (!widget.picking && session.platform.requiresAccount)
+            _accountMenu(),
           IconButton(
             tooltip: '刷新文件',
-            onPressed: loading ? null : _load,
+            onPressed: loading || changingAccount ? null : _refresh,
             icon: const Icon(CupertinoIcons.arrow_clockwise, size: 20),
           ),
-          if (session.canManageFiles && session.platform.canCreateFolder)
-            if (widget.picking)
+          if (_canUpload || _canCreateFolder)
+            if (widget.picking && _canCreateFolder)
               IconButton(
                 tooltip: '新建文件夹',
                 onPressed: _newFolder,
                 icon: const Icon(CupertinoIcons.folder_badge_plus, size: 21),
               )
-            else
+            else if (!widget.picking)
               AppPopupMenuButton<String>(
                 key: const Key('browser-add-menu'),
                 tooltip: '上传或新建',
@@ -1490,22 +2435,41 @@ class _BrowserPageState extends State<BrowserPage> {
                     _newFolder();
                   }
                 },
-                actions: const [
-                  AppMenuAction(
-                    value: 'upload',
-                    label: '上传文件',
-                    icon: CupertinoIcons.cloud_upload,
-                  ),
-                  AppMenuAction(
-                    value: 'folder',
-                    label: '新建文件夹',
-                    icon: CupertinoIcons.folder_badge_plus,
-                  ),
+                actions: [
+                  if (_canUpload)
+                    const AppMenuAction(
+                      value: 'upload',
+                      label: '上传文件',
+                      icon: CupertinoIcons.cloud_upload,
+                    ),
+                  if (_canCreateFolder)
+                    const AppMenuAction(
+                      value: 'folder',
+                      label: '新建文件夹',
+                      icon: CupertinoIcons.folder_badge_plus,
+                    ),
                 ],
               ),
         ],
         child: Column(
           children: [
+            if (!widget.picking &&
+                session.platform == CloudPlatform.baidu &&
+                session.mode == BrowseMode.share &&
+                session.sourceLink != null)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: BaiduShareRoutePicker(
+                    value: BaiduShareRoute.fromSession(session),
+                    onChanged: loading || changingAccount
+                        ? null
+                        : _switchBaiduRoute,
+                  ),
+                ),
+              ),
+            if (session.platform == CloudPlatform.github) _githubContext(),
             if (!widget.picking &&
                 session.mode == BrowseMode.personal &&
                 session.platform.supportsFamilyCloud)
@@ -1563,6 +2527,8 @@ class _BrowserPageState extends State<BrowserPage> {
               ),
             ),
             _browserToolbar(files),
+            if (_includeSubfolders && search.text.trim().isNotEmpty)
+              _searchSummary(),
             if (_selecting && !widget.picking)
               Container(
                 color: fill(context),
@@ -1582,12 +2548,17 @@ class _BrowserPageState extends State<BrowserPage> {
                       ),
                       const SizedBox(width: 8),
                       TextButton(
-                        onPressed: selection.isEmpty
+                        onPressed:
+                            selection.isEmpty ||
+                                selection.any(
+                                  (f) => !_provider.canDownloadFile(session, f),
+                                )
                             ? null
                             : () => _operate('download', selection),
                         child: const Text('下载'),
                       ),
-                      if (session.mode == BrowseMode.share &&
+                      if (!_searchResults &&
+                          session.mode == BrowseMode.share &&
                           session.platform != CloudPlatform.lanzou &&
                           session.platform != CloudPlatform.ctfile &&
                           session.platform.requiresAccount &&
@@ -1598,13 +2569,16 @@ class _BrowserPageState extends State<BrowserPage> {
                               : () => _operate('save', selection),
                           child: const Text('转存'),
                         )
-                      else if (session.canManageFiles) ...[
-                        TextButton(
-                          onPressed: selection.isEmpty
-                              ? null
-                              : () => _operate('move', selection),
-                          child: const Text('移动'),
-                        ),
+                      else if (!_searchResults && session.canManageFiles) ...[
+                        if (selection.every(
+                          (f) => _provider.canMoveFile(session, f),
+                        ))
+                          TextButton(
+                            onPressed: selection.isEmpty
+                                ? null
+                                : () => _operate('move', selection),
+                            child: const Text('移动'),
+                          ),
                         if (session.platform.supportsSharing)
                           TextButton(
                             onPressed: selection.isEmpty
@@ -1612,15 +2586,18 @@ class _BrowserPageState extends State<BrowserPage> {
                                 : () => _operate('share', selection),
                             child: const Text('分享'),
                           ),
-                        TextButton(
-                          onPressed: selection.isEmpty
-                              ? null
-                              : () => _operate('delete', selection),
-                          child: const Text(
-                            '删除',
-                            style: TextStyle(color: Colors.red),
+                        if (selection.every(
+                          (f) => _provider.canDeleteFile(session, f),
+                        ))
+                          TextButton(
+                            onPressed: selection.isEmpty
+                                ? null
+                                : () => _operate('delete', selection),
+                            child: const Text(
+                              '删除',
+                              style: TextStyle(color: Colors.red),
+                            ),
                           ),
-                        ),
                       ],
                     ],
                   ),
@@ -1638,14 +2615,32 @@ class _BrowserPageState extends State<BrowserPage> {
                             children: [
                               const AppLoadingIndicator(size: 40),
                               const SizedBox(height: 16),
-                              Text(
-                                '正在加载网盘文件…',
-                                textAlign: TextAlign.center,
-                                style: TextStyle(
-                                  fontSize: 14,
-                                  height: 1.5,
-                                  color: secondary(context),
-                                ),
+                              ValueListenableBuilder<List<OperationStep>>(
+                                valueListenable: _progress,
+                                builder: (context, steps, _) {
+                                  final read = steps
+                                      .where(
+                                        (step) =>
+                                            step.stage ==
+                                            OperationStage.readFiles,
+                                      )
+                                      .lastOrNull;
+                                  final label = read?.waitingForRetry == true
+                                      ? '请求较频繁，正在等待重试…'
+                                      : '正在加载网盘文件…';
+                                  final count = read?.itemsRead;
+                                  return Text(
+                                    count == null
+                                        ? label
+                                        : '$label\n已读取 $count 项',
+                                    textAlign: TextAlign.center,
+                                    style: TextStyle(
+                                      fontSize: 14,
+                                      height: 1.5,
+                                      color: secondary(context),
+                                    ),
+                                  );
+                                },
                               ),
                             ],
                           ),
@@ -1663,11 +2658,23 @@ class _BrowserPageState extends State<BrowserPage> {
                     )
                   : files.isEmpty
                   ? EmptyPanel(
-                      search.text.isEmpty ? '文件夹为空' : '没有匹配的文件',
-                      widget.picking ? '可选择当前文件夹作为目标' : '下拉刷新文件列表',
+                      _searchResults
+                          ? _deepSearch.running
+                                ? '正在搜索子文件夹…'
+                                : '暂未找到匹配的文件'
+                          : search.text.isEmpty
+                          ? '文件夹为空'
+                          : '没有匹配的文件',
+                      _searchResults
+                          ? _deepSearch.phase == CloudSearchPhase.completed
+                                ? '试试其他文件名或关键词'
+                                : '结果可能不完整，可重新搜索或查看未能读取的文件夹'
+                          : widget.picking
+                          ? '可选择当前文件夹作为目标'
+                          : '下拉刷新文件列表',
                     )
                   : RefreshIndicator(
-                      onRefresh: _load,
+                      onRefresh: _refresh,
                       child: LayoutBuilder(
                         builder: (context, constraints) =>
                             _fileList(files, constraints),

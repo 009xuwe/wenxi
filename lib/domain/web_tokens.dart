@@ -6,6 +6,7 @@ import 'xunlei_web_login.dart';
 /// The public web clients store token objects, rather than login cookies.
 class WebTokens {
   static bool supports(CloudPlatform platform) =>
+      platform == CloudPlatform.pikpak ||
       platform == CloudPlatform.feijipan ||
       platform == CloudPlatform.aliyun ||
       platform == CloudPlatform.guangya ||
@@ -120,7 +121,9 @@ class WebTokens {
       'authType': 'webToken',
       'userId': pick(['user_id', 'userId', 'sub']),
       'nickname': pick(['nick_name', 'nickname', 'name', 'user_name']),
-      if (platform == CloudPlatform.guangya || platform == CloudPlatform.xunlei)
+      if (platform == CloudPlatform.guangya ||
+          platform == CloudPlatform.xunlei ||
+          platform == CloudPlatform.pikpak)
         'deviceId': pick(['device_id', 'deviceId']),
       if (platform == CloudPlatform.xunlei) ...{
         'clientId': XunleiWebLogin.clientId,

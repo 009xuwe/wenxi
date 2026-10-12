@@ -165,9 +165,9 @@ class _TorrentPageState extends State<TorrentPage> {
             : Column(
                 children: [
                   ListTile(
-                    leading: const Icon(
+                    leading: Icon(
                       CupertinoIcons.arrow_down_circle,
-                      color: brandBlue,
+                      color: themeAccent(context),
                     ),
                     title: Text(
                       info.name,
@@ -234,7 +234,7 @@ class _TorrentPageState extends State<TorrentPage> {
                                   onPressed: _adding || _playing
                                       ? null
                                       : () => _play(file),
-                                  color: brandBlue,
+                                  color: themeAccent(context),
                                   icon: const Icon(
                                     CupertinoIcons.play_circle_fill,
                                     size: 30,

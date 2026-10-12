@@ -1398,6 +1398,8 @@ void main() {
       expect(find.byType(WebLoginPage), findsNothing);
       await tester.tap(find.byTooltip('夸克网盘账号操作'));
       await tester.pumpAndSettle();
+      await tester.ensureVisible(find.text('退出账号'));
+      await tester.pumpAndSettle();
       await tester.tap(find.text('退出账号'));
       await tester.pumpAndSettle();
       await tester.tap(find.text('确定'));

@@ -99,6 +99,60 @@ class PublicFilesTest(unittest.TestCase):
         subprocess.run(['git', '-C', str(self.root), 'add', '-f', 'logs/accounts.json'], check=True)
         self.assertFalse(public.check(self.root, staged=True)['passed'])
 
+    def test_repository_rules_keep_local_tools_out_of_public_export(self):
+        shutil.copy2(ROOT / '.gitignore', self.root / '.gitignore')
+        private_paths = [
+            '\u516c\u544a\u7f16\u8f91\u5668.html',
+            'tool/announcement-editor.test.cjs', 'announcements.json',
+            'config-1.7.0.json', 'config-2.0.0.json', '\u4ea4\u4e92.txt',
+            'docs/CLOUD-PROVIDERS-2026-09-24.md',
+            'docs/OPENLIST-CLOUDS-SMS-2026-09-24.md',
+            'docs/QUARK-AUTHENTICATED-DIRECT-DOWNLOAD.md',
+            'native/gopeed/internal/protocol/http/build.data',
+            'native/gopeed/internal/protocol/http/download.data',
+            'setup.exe', 'app-release.apk', 'download.zip', 'capture.har',
+        ]
+        public_paths = [
+            'config/announcements.example.json', 'docs/ANNOUNCEMENTS.md',
+            'lib/domain/announcements.dart', 'docs/images/promo-android.png',
+            '\u8fdc\u7a0b\u914d\u7f6e\u7f16\u8f91\u5668.html',
+            'tool/remote-control-editor.test.cjs',
+            'native/third_party/libmpv-android-build-v1.1.7.zip',
+        ]
+        for name in private_paths + public_paths:
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('synthetic fixture\n', encoding='utf-8')
+        target = self.root.parent / 'public'
+        self.assertTrue(public.check(self.root, export=target)['passed'])
+        for name in private_paths:
+            with self.subTest(private_path=name):
+                self.assertFalse((target / name).exists())
+                self.assertTrue((self.root / name).is_file())
+        for name in public_paths:
+            with self.subTest(public_path=name):
+                self.assertTrue((target / name).is_file())
+
+    def test_force_added_local_tools_are_rejected_by_staged_check(self):
+        subprocess.run(['git', 'init', '--quiet', str(self.root)], check=True)
+        shutil.copy2(ROOT / '.gitignore', self.root / '.gitignore')
+        paths = [
+            '\u516c\u544a\u7f16\u8f91\u5668.html',
+            'tool/announcement-editor.test.cjs', 'announcements.json',
+            'config-1.7.0.json', '\u4ea4\u4e92.txt',
+            'docs/QUARK-AUTHENTICATED-DIRECT-DOWNLOAD.md',
+            'setup.exe', 'download.zip', 'capture.har',
+            'native/gopeed/internal/protocol/http/download.data',
+        ]
+        for name in paths:
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('synthetic fixture\n', encoding='utf-8')
+        subprocess.run(['git', '-C', str(self.root), 'add', '-f', '--', *paths], check=True)
+        report = public.check(self.root, staged=True)
+        self.assertFalse(report['passed'])
+        self.assertEqual({item['path'] for item in report['findings']}, set(paths))
+
     def test_reviewed_fixture_is_bound_to_its_hash(self):
         (self.root / 'tool').mkdir()
         data = b'-----BEGIN ' + b'PRIVATE KEY-----\nsynthetic\n'

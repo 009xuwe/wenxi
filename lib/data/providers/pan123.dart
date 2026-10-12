@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math';
 import 'package:crypto/crypto.dart';
 import '../../core/json.dart';
@@ -17,6 +18,8 @@ class Pan123Connector extends CloudConnector {
     this.http,
     this.vault, {
     this.taskDelay = const Duration(seconds: 1),
+    this.listDelay = const Duration(milliseconds: 600),
+    this.listWait = RequestScope.wait,
     this.stageCleanup,
     DateTime Function()? now,
   }) : now = now ?? DateTime.now;
@@ -24,10 +27,17 @@ class Pan123Connector extends CloudConnector {
   final Future<void> Function(DownloadCleanup)? stageCleanup;
   final CredentialStore vault;
   final Duration taskDelay;
+  final Duration listDelay;
+  final Future<void> Function(Duration) listWait;
   final DateTime Function() now;
   final _uuids = <String, Future<String>>{};
   final _refreshing = <int, (Credential, Future<Credential>)>{};
+  final _listingGate = AsyncGate();
+  DateTime? _nextListingAt;
+  late Duration _listingInterval = listDelay;
   static const _expired = AccountLoginRequired('123 登录已失效，请重新登录');
+  // Personal file lists can return HTTP 200 with code 20101 for an expired login.
+  static const _expiredCodes = {401, 20101};
   static const autoLoginFailureMessage = '123 自动登录失败，请重新登录或切换网页登录';
   static const _autoFailed = AccountLoginRequired(autoLoginFailureMessage);
   static const _accountChanged = AccountLoginRequired('123 账号已退出或发生变化，请重新登录');
@@ -47,8 +57,14 @@ class Pan123Connector extends CloudConnector {
     })(),
   );
   Json check(Json j) {
-    if (j.integer('code') == 401) {
-      throw const AccountLoginRequired('123 登录已失效，请重新登录');
+    if (_expiredCodes.contains(j.integer('code', -1))) throw _expired;
+    if ({100011, 429}.contains(j.integer('code', -1))) {
+      throw const HttpRequestFailure(
+        '123 请求过于频繁，请稍后重试',
+        kind: 'providerRateLimit',
+        status: 429,
+        retryable: true,
+      );
     }
     require(
       j.integer('code', -1) == 0,
@@ -61,6 +77,15 @@ class Pan123Connector extends CloudConnector {
     RequestScope.checkpoint();
     if (result.status == 401) {
       throw const AccountLoginRequired('123 登录已失效，请重新登录');
+    }
+    if (result.status == 429) {
+      throw HttpRequestFailure(
+        '123 请求过于频繁，请稍后重试',
+        kind: 'http',
+        status: 429,
+        retryAfter: result.header('retry-after'),
+        retryable: true,
+      );
     }
     final json = result.json;
     require(
@@ -239,7 +264,7 @@ class Pan123Connector extends CloudConnector {
       final result = await send(token);
       checkpoint();
       final json = response(result);
-      if (json.integer('code', -1) == 401) throw _expired;
+      if (_expiredCodes.contains(json.integer('code', -1))) throw _expired;
       return json;
     }
 
@@ -562,8 +587,8 @@ class Pan123Connector extends CloudConnector {
     String parent,
     int page,
   ) async {
-    final data = check(
-      response(
+    final data = (await _listPage(
+      () async => response(
         await http.get(
           query('https://yun.123pan.cn/b/api/share/get', {
             'limit': 100,
@@ -578,10 +603,54 @@ class Pan123Connector extends CloudConnector {
           {'User-Agent': dartUa},
         ),
       ),
-    ).obj('data');
+    )).obj('data');
     require(!data.boolean('Expired'), '123 分享已失效');
     return data;
   }
+
+  // Pace each listing page, including pages of the same folder. A shared gate
+  // also prevents concurrent searches from amplifying an API cooldown.
+  Future<Json> _listPage(Future<Json> Function() read) =>
+      RequestScope.cancellable(
+        _listingGate.run(() async {
+          for (var attempt = 0; ; attempt++) {
+            RequestScope.checkpoint();
+            final remaining = _nextListingAt?.difference(now());
+            if (remaining != null && remaining > Duration.zero) {
+              await listWait(remaining);
+            }
+            RequestScope.checkpoint();
+            _nextListingAt = now().add(_listingInterval);
+            try {
+              return check(await read());
+            } on HttpRequestFailure catch (failure) {
+              if (failure.status != 429) rethrow;
+              if (_listingInterval < const Duration(seconds: 1)) {
+                _listingInterval = const Duration(seconds: 1);
+              }
+              var delay = Duration(seconds: const [2, 5, 10][attempt]);
+              final seconds = int.tryParse(failure.retryAfter.trim());
+              Duration? serverDelay;
+              if (seconds != null && seconds >= 0) {
+                serverDelay = Duration(seconds: seconds);
+              } else if (failure.retryAfter.isNotEmpty) {
+                try {
+                  serverDelay = HttpDate.parse(
+                    failure.retryAfter,
+                  ).difference(now().toUtc());
+                } catch (_) {}
+              }
+              if (serverDelay != null && serverDelay > delay) {
+                delay = serverDelay;
+              }
+              _nextListingAt = now().add(delay);
+              // Only listing reads are replayed, at most twice. Mutations and
+              // password login keep their existing retry rules.
+              if (attempt >= 2) rethrow;
+            }
+          }
+        }),
+      );
 
   String _thumbnail(Json item) {
     final uri = Uri.tryParse(item.str('DownloadUrl'));
@@ -658,8 +727,8 @@ class Pan123Connector extends CloudConnector {
               parent,
               page,
             )
-          : check(
-              await getAuth(
+          : (await _listPage(
+              () => getAuth(
                 query('https://yun.123pan.cn/b/api/file/list/new', {
                   'driveId': 0,
                   'limit': 100,
@@ -678,7 +747,7 @@ class Pan123Connector extends CloudConnector {
                 '/b/api/file/list/new',
                 c!,
               ),
-            ).obj('data');
+            )).obj('data');
       final batch = _files(data, parent);
       final fresh = batch.where((f) => seen.add(f.id)).toList();
       all.addAll(fresh);

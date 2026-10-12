@@ -19,7 +19,16 @@ PRIVATE_ROOTS = {
     '.local', '.dart_tool', '.idea', 'logs', 'logo', 'releases',
     'caiiliao', 'build', 'coverage', '\u6f14\u793a\u622a\u56fe',
 }
-PRIVATE_FILES = {'control.json', 'config.fixed.json', 'LanzouAPI-master.zip'}
+PRIVATE_FILES = {
+    'control.json', 'config.fixed.json', 'LanzouAPI-master.zip',
+    'announcements.json', '\u516c\u544a\u7f16\u8f91\u5668.html',
+    'tool/announcement-editor.test.cjs', '\u4ea4\u4e92.txt',
+    'docs/CLOUD-PROVIDERS-2026-09-24.md',
+    'docs/OPENLIST-CLOUDS-SMS-2026-09-24.md',
+    'docs/QUARK-AUTHENTICATED-DIRECT-DOWNLOAD.md',
+    'native/gopeed/internal/protocol/http/build.data',
+    'native/gopeed/internal/protocol/http/download.data',
+}
 PATTERNS = {
     'private-key': re.compile(rb'-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----'),
     'github-token': re.compile(rb'\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{40,})\b'),
@@ -69,10 +78,19 @@ def path_issue(name):
         return 'unsafe-path'
     if path.parts[0].lower() in PRIVATE_ROOTS or name in PRIVATE_FILES:
         return 'private-or-generated-path'
+    if len(path.parts) == 1 and re.fullmatch(r'config-\d[^/]*\.json', name, re.I):
+        return 'local-release-configuration'
+    if len(path.parts) == 1 and path.suffix.lower() == '.zip':
+        return 'local-archive'
     if path.name in {'keystore.properties', 'key.properties', 'local.properties'}:
         return 'local-configuration'
-    if path.suffix.lower() in {'.jks', '.keystore', '.p12', '.pfx', '.apk', '.aab'}:
+    if path.suffix.lower() in {
+        '.jks', '.keystore', '.p12', '.pfx', '.apk', '.aab',
+        '.exe', '.msi', '.msix', '.msixbundle',
+    }:
         return 'credentials-or-release-binary'
+    if path.suffix.lower() in {'.har', '.pcap', '.pcapng'}:
+        return 'network-capture'
     if (path.name == '.env' or path.name.startswith('.env.')) and not path.name.endswith('.example'):
         return 'environment-file'
     if name.startswith('android/app/libs/') and path.suffix in {'.aar', '.jar'}:

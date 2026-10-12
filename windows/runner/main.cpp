@@ -4,12 +4,31 @@
 
 #include "flutter_window.h"
 #include "utils.h"
+#include "external_download_request.h"
 
 int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
                       _In_ wchar_t *command_line, _In_ int show_command) {
   HANDLE single_instance = ::CreateMutexW(nullptr, FALSE, L"Local\\AsterLink.Flutter.v1");
   if (single_instance != nullptr && ::GetLastError() == ERROR_ALREADY_EXISTS) {
     HWND existing = ::FindWindowW(nullptr, L"\u6587\u6790\u52a9\u624b");
+    const auto request = DownloadLaunchArgument(GetCommandLineArguments());
+    if (!request.empty()) {
+      for (int attempt = 0; !existing && attempt < 40; ++attempt) {
+        ::Sleep(50);
+        existing = ::FindWindowW(nullptr, L"\u6587\u6790\u52a9\u624b");
+      }
+      COPYDATASTRUCT data{};
+      data.dwData = kExternalDownloadMessage;
+      data.cbData = static_cast<DWORD>(request.size() + 1);
+      data.lpData = const_cast<char*>(request.c_str());
+      DWORD_PTR accepted = 0;
+      if (!existing || !::SendMessageTimeoutW(existing, WM_COPYDATA, 0,
+          reinterpret_cast<LPARAM>(&data), SMTO_ABORTIFHUNG | SMTO_BLOCK,
+          3000, &accepted) || accepted == 0) {
+        ::MessageBoxW(nullptr, L"下载链接暂未送达，请等待文析助手启动完成后重试。",
+                      L"文析助手", MB_OK | MB_ICONINFORMATION);
+      }
+    }
     if (existing != nullptr) {
       ::ShowWindow(existing, SW_RESTORE);
       ::SetForegroundWindow(existing);

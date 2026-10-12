@@ -22,6 +22,7 @@ PlaybackController cloudPlayback(
   CloudFile initial,
   List<CloudFile> candidates, {
   String? initialHistoryKey,
+  Map<String, String> parentFolders = const {},
   PlaybackBackend Function(PlaybackEntry, bool)? backendFactory,
 }) {
   session = services.cloud.bindSession(session);
@@ -42,7 +43,18 @@ PlaybackController cloudPlayback(
         name: file.name,
         video: kind == FileKind.video,
         platform: session.platform,
-        source: PlaybackSource.cloud(DownloadOrigin(session, file, revision)),
+        source: PlaybackSource.cloud(
+          DownloadOrigin(
+            session,
+            file.parentId.isEmpty && parentFolders[file.id]?.isNotEmpty == true
+                ? CloudFile.fromJson({
+                    ...file.toJson(),
+                    'parentId': parentFolders[file.id],
+                  })
+                : file,
+            revision,
+          ),
+        ),
       ),
   ];
   final subtitleFiles = {

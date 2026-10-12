@@ -448,12 +448,12 @@ class _UcTvAuthorizationPageState extends State<UcTvAuthorizationPage>
                       ),
                     )
                   else if (granted)
-                    const Padding(
+                    Padding(
                       padding: EdgeInsets.symmetric(vertical: 28),
                       child: Icon(
                         CupertinoIcons.checkmark_circle_fill,
                         size: 60,
-                        color: brandBlue,
+                        color: themeAccent(context),
                       ),
                     ),
                   const SizedBox(height: 24),

@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:convert';
 import 'package:media_kit/media_kit.dart';
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
@@ -12,6 +13,9 @@ import 'package:asterlink/main.dart';
 import 'package:asterlink/ui/player_page.dart';
 import 'package:asterlink/ui/loading_indicator.dart';
 import 'package:asterlink/ui/player_theme.dart';
+import 'package:asterlink/platform/player_screenshot.dart';
+import 'package:asterlink/playback/playback_sleep_timer.dart';
+import 'package:asterlink/ui/subtitle_appearance.dart';
 import 'package:asterlink/core/json.dart';
 import 'package:asterlink/playback/external_stream.dart';
 import 'player_support.dart';
@@ -22,6 +26,29 @@ class _FixtureExternalStream extends ExternalPlaybackStream {
   Future<void> start() async {}
   @override
   String get url => 'http://127.0.0.1:12345/fixture/video';
+}
+
+class _ScreenshotActions extends PlayerScreenshotActions {
+  final calls = <String>[];
+  @override
+  bool get canCopy => true;
+  @override
+  bool get canShare => true;
+  @override
+  Future<String?> save(Uint8List bytes, String name) async {
+    calls.add('save:$name');
+    return '测试目录';
+  }
+
+  @override
+  Future<void> copy(Uint8List bytes) async {
+    calls.add('copy');
+  }
+
+  @override
+  Future<void> share(Uint8List bytes, String name, Rect origin) async {
+    calls.add('share');
+  }
 }
 
 void main() {
@@ -62,6 +89,7 @@ void main() {
     Future<bool> Function()? confirmDownload,
     VoidCallback? onDownload,
     bool settle = true,
+    PlayerScreenshotActions screenshotActions = const PlayerScreenshotActions(),
   }) async {
     tester.view.devicePixelRatio = 1;
     tester.view.physicalSize = size;
@@ -101,6 +129,7 @@ void main() {
               subtitleDirectory: directory,
               device: device,
               chooseSubtitle: chooseSubtitle,
+              screenshotActions: screenshotActions,
               confirmDownload: confirmDownload,
               onDownload: downloadAvailable
                   ? (_) async {
@@ -169,6 +198,20 @@ void main() {
     await tap(tester, find.byTooltip('播放设置'));
     await tester.ensureVisible(find.text(label));
     await tap(tester, find.text(label));
+  }
+
+  Future<void> scrollPanelTo(WidgetTester tester, Finder target) async {
+    await tester.scrollUntilVisible(
+      target,
+      140,
+      scrollable: find
+          .descendant(
+            of: find.byKey(const Key('player-panel')),
+            matching: find.byType(Scrollable),
+          )
+          .last,
+    );
+    await tester.pumpAndSettle();
   }
 
   Future<void> doubleTap(WidgetTester tester, Offset position) async {
@@ -408,7 +451,10 @@ void main() {
         final slider = tester.widget<Slider>(
           find.byKey(const Key('player-seek')),
         );
-        expect(slider.activeColor, playerAccent);
+        expect(
+          slider.activeColor,
+          playerAccent(tester.element(find.byKey(const Key('player-seek')))),
+        );
         await tap(tester, find.byTooltip('播放设置'));
         final panel = tester.widget<Material>(
           find.byKey(const Key('player-panel')),
@@ -445,7 +491,7 @@ void main() {
         find.byKey(const Key('player-capture')),
         matchesGoldenFile('goldens/player-settings-landscape.png'),
       );
-      await tester.ensureVisible(find.text('记住播放进度'));
+      await scrollPanelTo(tester, find.text('记住播放进度'));
       await tester.pumpAndSettle();
       await tap(tester, find.text('记住播放进度'));
       expect(page.fixture.history.preferences.resume, isFalse);
@@ -563,13 +609,144 @@ void main() {
       expect(fullscreen.right, lessThanOrEqualTo(616));
       expect(fullscreen.bottom, lessThanOrEqualTo(300));
       await tap(tester, find.byKey(const Key('player-playlist')));
-      await tester.ensureVisible(find.byKey(const Key('episode-1')));
+      await scrollPanelTo(tester, find.byKey(const Key('episode-1')));
       await tester.pumpAndSettle();
       await tap(tester, find.byKey(const Key('episode-1')));
       expect(page.fixture.controller.index, 1);
       expect(tester.takeException(), isNull);
     },
   );
+
+  testWidgets(
+    'Desktop subtitle minimum reaches the bottom after controls hide',
+    (tester) async {
+      final page = await render(tester, size: const Size(1280, 800));
+      await page.fixture.controller.updatePreferences(
+        page.fixture.controller.preferences.copyWith(subtitleBottom: 0),
+      );
+      await tester.pump();
+      await tester.tapAt(const Offset(400, 300));
+      await tester.pumpAndSettle();
+      final caption = tester.getRect(find.byKey(const Key('player-captions')));
+      expect(caption.bottom, closeTo(800, 1));
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets('Desktop subtitle panel previews the real lowest position', (
+    tester,
+  ) async {
+    final page = await render(tester, size: const Size(1280, 800));
+    await openSetting(tester, '字幕');
+    final slider = find.byKey(const Key('player-subtitle-position'));
+    await tester.ensureVisible(slider);
+    await tester.pumpAndSettle();
+    final track = tester.widget<Slider>(slider);
+    track.onChanged!(0);
+    track.onChangeEnd!(0);
+    await tester.pumpAndSettle();
+    expect(page.fixture.controller.preferences.subtitleBottom, 0);
+    expect(find.text('字幕位置  距底部 0%'), findsOneWidget);
+    expect(
+      tester.getRect(find.byKey(const Key('player-captions'))).bottom,
+      closeTo(800, 1),
+    );
+    expect(
+      find.byKey(const Key('player-play-pause')).hitTestable(),
+      findsNothing,
+    );
+    await tap(tester, find.byTooltip('关闭面板'));
+    expect(
+      find.byKey(const Key('player-play-pause')).hitTestable(),
+      findsOneWidget,
+    );
+  });
+
+  for (final size in [
+    const Size(393, 864),
+    const Size(1280, 800),
+    const Size(844, 390),
+  ]) {
+    testWidgets(
+      'Subtitle background can be customized and remembered at $size',
+      (tester) async {
+        final page = await render(tester, size: size);
+        await openSetting(tester, '字幕');
+        final panelScroll = find
+            .descendant(
+              of: find.byKey(const Key('player-panel')),
+              matching: find.byType(Scrollable),
+            )
+            .last;
+        await tester.scrollUntilVisible(
+          find.text('自定义'),
+          150,
+          scrollable: panelScroll,
+        );
+        await tester.pumpAndSettle();
+        await tap(tester, find.text('自定义'));
+        await tester.ensureVisible(find.text('选择颜色'));
+        await tester.pumpAndSettle();
+        await tap(tester, find.text('选择颜色'));
+        final hex = find.byKey(const Key('subtitle-background-hex'));
+        await tester.ensureVisible(hex);
+        await tester.enterText(hex, 'invalid');
+        await tester.pump();
+        expect(
+          tester
+              .widget<FilledButton>(find.widgetWithText(FilledButton, '确定'))
+              .onPressed,
+          isNull,
+        );
+        await tester.enterText(hex, '#245A80');
+        await tester.pump();
+        await tap(tester, find.text('确定'));
+        final slider = find.byKey(
+          const Key('subtitle-background-transparency'),
+        );
+        await tester.ensureVisible(slider);
+        await tester.pumpAndSettle();
+        final track = tester.widget<Slider>(slider);
+        track.onChanged!(.25);
+        await tester.pump();
+        tester.widget<Slider>(slider).onChangeEnd!(.25);
+        await tester.pumpAndSettle();
+        expect(
+          page.fixture.history.preferences.subtitleBackgroundArgb,
+          0xbf245a80,
+        );
+        final caption = tester.widget<SubtitleCaption>(
+          find.ancestor(
+            of: find.byKey(const Key('player-captions')),
+            matching: find.byType(SubtitleCaption),
+          ),
+        );
+        expect(caption.backgroundColor, 0xbf245a80);
+        await tap(tester, find.byTooltip('关闭面板'));
+        await openSetting(tester, '字幕');
+        await tester.scrollUntilVisible(
+          find.text('选择颜色'),
+          150,
+          scrollable: panelScroll,
+        );
+        await tester.pumpAndSettle();
+        await tap(tester, find.text('选择颜色'));
+        expect(tester.widget<TextField>(hex).controller!.text, '#245A80');
+        await tester.ensureVisible(hex);
+        await tester.enterText(hex, '#ffffff');
+        await tap(tester, find.text('取消'));
+        expect(
+          page.fixture.history.preferences.subtitleBackgroundArgb,
+          0xbf245a80,
+        );
+        await tester.ensureVisible(find.text('无底色'));
+        await tester.pumpAndSettle();
+        await tap(tester, find.text('无底色'));
+        expect(page.fixture.history.preferences.subtitleBackgroundArgb, isNull);
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
 
   testWidgets(
     'Single-tap fade starts next frame and retains controls through system-inset changes',
@@ -722,7 +899,7 @@ void main() {
       expect(page.fixture.current.connections, 8);
       await tap(tester, find.byTooltip('播放设置'));
       final choice = find.byKey(const Key('player-connections-16'));
-      await tester.ensureVisible(choice);
+      await scrollPanelTo(tester, choice);
       await tap(tester, choice);
       expect(page.fixture.current.connections, 16);
       expect(page.fixture.history.preferences.connections, 16);
@@ -1166,4 +1343,179 @@ void main() {
       expect(page.fixture.controller.error, isEmpty);
     },
   );
+
+  testWidgets(
+    'Playlist lazily renders a thousand entries, centers current and searches watched progress',
+    (tester) async {
+      final f = PlaybackFixture(
+        initialIndex: 700,
+        suppliedEntries: List.generate(
+          1000,
+          (i) => PlaybackEntry(
+            id: '$i',
+            key: '$i',
+            name: '演示 第${i + 1}集.mp4',
+            video: true,
+            settingsFolder: 'show',
+          ),
+        ),
+      );
+      await f.history.save(
+        '10',
+        const PlaybackBookmark(
+          position: Duration(minutes: 5),
+          duration: Duration(minutes: 10),
+          updatedAt: 1,
+        ),
+      );
+      await render(tester, suppliedFixture: f);
+      await openSetting(tester, '选集');
+      expect(
+        find.byKey(const Key('episode-700')).hitTestable(),
+        findsOneWidget,
+      );
+      expect(find.byKey(const Key('episode-0')), findsNothing);
+      expect(find.byType(InkWell).evaluate().length, lessThan(80));
+      await tester.enterText(
+        find.byKey(const Key('player-episode-search')),
+        '第11集',
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('已看 05:00 / 10:00'), findsOneWidget);
+      await tap(tester, find.byKey(const Key('episode-10')));
+      expect(f.controller.index, 10);
+      expect(f.controller.entries.length, 1000);
+      await openSetting(tester, '选集');
+      await tap(tester, find.byKey(const Key('player-episode-order')));
+      await tap(tester, find.text('集数倒序').last);
+      expect(f.controller.index, 10);
+      expect(f.controller.playlistIndices.first, 999);
+      expect(find.byKey(const Key('episode-10')).hitTestable(), findsOneWidget);
+      expect(f.history.orderFor('show'), PlaybackPlaylistOrder.descending);
+    },
+  );
+
+  testWidgets(
+    'Aspect presets and custom width-height validation work in a narrow player',
+    (tester) async {
+      final page = await render(tester, size: const Size(320, 700), scale: 1.4);
+      await openSetting(tester, '画面');
+      await tap(tester, find.byKey(const Key('player-aspect-4:3')));
+      expect(page.fixture.controller.preferences.aspectRatio, 4 / 3);
+      await tester.ensureVisible(find.byKey(const Key('player-aspect-width')));
+      await tester.enterText(find.byKey(const Key('player-aspect-width')), '2');
+      await tester.enterText(
+        find.byKey(const Key('player-aspect-height')),
+        '0',
+      );
+      await tester.ensureVisible(find.byKey(const Key('player-aspect-apply')));
+      await tap(tester, find.byKey(const Key('player-aspect-apply')));
+      expect(find.textContaining('请输入有效宽高'), findsOneWidget);
+      expect(page.fixture.controller.preferences.aspectRatio, 4 / 3);
+      await tester.enterText(
+        find.byKey(const Key('player-aspect-height')),
+        '1',
+      );
+      await tester.pumpAndSettle();
+      await scrollPanelTo(tester, find.byKey(const Key('player-aspect-apply')));
+      await tap(tester, find.byKey(const Key('player-aspect-apply')));
+      expect(page.fixture.controller.preferences.aspectRatio, 2);
+      expect(page.fixture.controller.preferences.fit, PlaybackFit.contain);
+      expect(page.fixture.history.preferences.aspectRatio, 2);
+      expect(page.fixture.controller.videoGeometry?.aspectRatio, 1920 / 1080);
+    },
+  );
+
+  testWidgets(
+    'Sleep panel supports preset, custom validation and cancellation on landscape',
+    (tester) async {
+      final page = await render(tester, size: const Size(844, 390));
+      await openSetting(tester, '定时停止');
+      await tap(tester, find.byKey(const Key('player-sleep-30')));
+      expect(
+        page.fixture.controller.sleepTimer.mode,
+        PlaybackSleepMode.duration,
+      );
+      await tester.ensureVisible(find.byKey(const Key('player-sleep-minutes')));
+      await tester.enterText(
+        find.byKey(const Key('player-sleep-minutes')),
+        '0',
+      );
+      await tester.ensureVisible(find.byKey(const Key('player-sleep-apply')));
+      await tap(tester, find.byKey(const Key('player-sleep-apply')));
+      expect(find.text('请输入 1 至 720 分钟'), findsOneWidget);
+      await tester.enterText(
+        find.byKey(const Key('player-sleep-minutes')),
+        '20',
+      );
+      await tester.ensureVisible(find.byKey(const Key('player-sleep-apply')));
+      await tap(tester, find.byKey(const Key('player-sleep-apply')));
+      expect(
+        page.fixture.controller.sleepTimer.remaining!.inMinutes,
+        inInclusiveRange(19, 20),
+      );
+      await tester.ensureVisible(find.byKey(const Key('player-sleep-cancel')));
+      await tap(tester, find.byKey(const Key('player-sleep-cancel')));
+      expect(page.fixture.controller.sleepTimer.mode, PlaybackSleepMode.off);
+      expect(page.fixture.current.state.playing, isTrue);
+    },
+  );
+
+  for (final (initiallyPlaying, stopDuringCapture) in [
+    (true, false),
+    (true, true),
+    (false, false),
+  ]) {
+    testWidgets(
+      'Screenshot exports the video frame with playing=$initiallyPlaying and timer stop=$stopDuringCapture',
+      (tester) async {
+        final f = PlaybackFixture();
+        f.configureBackend = (backend) {
+          backend.screenshotSupported = true;
+          backend.nativeSubtitles = true;
+          backend.screenshotBytes = base64Decode(
+            'iVBORw0KGgoAAAANSUhEUgAAABAAAAAJCAIAAAC0SDtlAAAAFElEQVR4nGNwaDhAEmIY1TAoNAAA0JDYAfmWJooAAAAASUVORK5CYII=',
+          );
+        };
+        final actions = _ScreenshotActions();
+        await render(tester, suppliedFixture: f, screenshotActions: actions);
+        if (!initiallyPlaying) {
+          await f.controller.pause();
+          await tester.pumpAndSettle();
+        }
+        await tap(tester, find.byKey(const Key('player-screenshot')));
+        expect(f.current.state.playing, isFalse);
+        expect(f.current.captures, [false]);
+        await tap(tester, find.byKey(const Key('player-screenshot-subtitles')));
+        expect(f.current.captures, [false, true]);
+        await tap(tester, find.byKey(const Key('player-screenshot-save')));
+        expect(actions.calls.single, startsWith('save:'));
+        expect(actions.calls.single, endsWith('.png'));
+        expect(find.text('已保存到 测试目录'), findsOneWidget);
+        await tester.ensureVisible(
+          find.byKey(const Key('player-screenshot-copy')),
+        );
+        await tap(tester, find.byKey(const Key('player-screenshot-copy')));
+        expect(actions.calls, contains('copy'));
+        await tester.ensureVisible(
+          find.byKey(const Key('player-screenshot-share')),
+        );
+        await tap(tester, find.byKey(const Key('player-screenshot-share')));
+        expect(actions.calls, contains('share'));
+        if (stopDuringCapture) {
+          f.controller.sleepTimer.schedule(const Duration(seconds: 1));
+          await tester.pump(const Duration(seconds: 2));
+        }
+        await tap(tester, find.byTooltip('关闭面板'));
+        expect(f.current.state.playing, initiallyPlaying && !stopDuringCapture);
+        expect(f.controller.sleepTimer.stopped, stopDuringCapture);
+        if (!initiallyPlaying) {
+          await tap(tester, find.byKey(const Key('player-screenshot')));
+          expect(f.current.captures, [false, true, false]);
+          await tap(tester, find.byTooltip('关闭面板'));
+          expect(f.current.state.playing, isFalse);
+        }
+      },
+    );
+  }
 }

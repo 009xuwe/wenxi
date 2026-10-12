@@ -22,18 +22,64 @@ void main() {
         'volume': 500,
         'subtitleSize': -5,
         'subtitleBottom': double.infinity,
+        'subtitleBackground': 'unknown',
+        'subtitleBackgroundColor': -1,
+        'subtitleBackgroundOpacity': double.nan,
         'fit': 'unknown',
       });
       expect(preferences.rate, 1);
       expect(preferences.volume, 100);
       expect(preferences.subtitleSize, 14);
       expect(preferences.subtitleBottom, .04);
+      expect(preferences.subtitleBackground, SubtitleBackground.none);
+      expect(preferences.subtitleBackgroundColor, 0);
+      expect(preferences.subtitleBackgroundOpacity, .5);
+      expect(preferences.subtitleBackgroundArgb, isNull);
       expect(preferences.fit, PlaybackFit.contain);
       expect(preferences.copyWith(rate: .1, volume: -4).rate, .25);
       expect(preferences.copyWith(rate: 8).rate, 4);
       expect(preferences.copyWith(volume: -4).volume, 0);
     },
   );
+  test('Subtitle appearance survives store reload and mode changes', () async {
+    final history = PlaybackStore(StateStore.memory());
+    expect(history.preferences.subtitleBackgroundArgb, isNull);
+    await history.savePreferences(
+      history.preferences.copyWith(
+        subtitleBackground: SubtitleBackground.custom,
+        subtitleBackgroundColor: 0x245a80,
+        subtitleBackgroundOpacity: .5,
+      ),
+    );
+    final reloaded = PlaybackStore(history.store).preferences;
+    expect(reloaded.subtitleBackgroundArgb, 0x80245a80);
+    final black = reloaded.copyWith(
+      subtitleBackground: SubtitleBackground.black,
+    );
+    expect(black.subtitleBackgroundArgb, 0x80000000);
+    expect(
+      black
+          .copyWith(subtitleBackground: SubtitleBackground.custom)
+          .subtitleBackgroundArgb,
+      0x80245a80,
+    );
+    expect(
+      reloaded.copyWith(subtitleBackgroundOpacity: 2).subtitleBackgroundOpacity,
+      1,
+    );
+    expect(
+      reloaded
+          .copyWith(subtitleBackgroundOpacity: -1)
+          .subtitleBackgroundOpacity,
+      0,
+    );
+    expect(
+      reloaded
+          .copyWith(subtitleBackground: SubtitleBackground.none)
+          .subtitleBackgroundArgb,
+      isNull,
+    );
+  });
   test('Resume ignores completed tails and clamps invalid positions', () {
     PlaybackBookmark bookmark(int seconds, {bool done = false}) =>
         PlaybackBookmark(

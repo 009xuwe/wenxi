@@ -1,5 +1,6 @@
 import '../core/json.dart';
 import 'models.dart';
+import 'github.dart';
 
 class LinkParser {
   static const _tail = r'''[^\s<>"'，。；！、【】《》「」\u3000\u200b]+''';
@@ -85,7 +86,8 @@ class LinkParser {
         var url = normalize(raw);
         var uri = Uri.parse(url);
         final platform = CloudPlatform.fromHost(uri.host);
-        if ((platform == CloudPlatform.ctfile ||
+        if ((platform == CloudPlatform.github ||
+                platform == CloudPlatform.ctfile ||
                 platform == CloudPlatform.feijipan) &&
             raw.contains('](')) {
           raw = raw.substring(0, raw.indexOf(']('));
@@ -102,7 +104,8 @@ class LinkParser {
             : null;
         // Most share IDs are ASCII; Lanzou also accepts custom Unicode paths.
         // Separate adjacent code labels without cutting those custom names.
-        if (platform != null || unsupported != null) {
+        if (platform != CloudPlatform.github &&
+            (platform != null || unsupported != null)) {
           final prose = (platform == CloudPlatform.lanzou
               ? _lanzouCodeLabel.allMatches(text, match.start).firstOrNull
               : RegExp(r'[\u3400-\u9fff]').firstMatch(raw));
@@ -196,11 +199,17 @@ class LinkParser {
           owner = leadingCodes ? after : before;
         }
       }
-      if (owner != null && owner.link.isCloudShare && !owner.hasEmbeddedCode) {
+      if (owner != null &&
+          owner.link.platform != CloudPlatform.github &&
+          owner.link.isCloudShare &&
+          !owner.hasEmbeddedCode) {
         final value = code[1]!;
         if (_isCode(value) &&
             (owner.link.platform == CloudPlatform.lanzou ||
                 owner.link.platform == CloudPlatform.ctfile ||
+                (owner.link.platform == CloudPlatform.pikpak &&
+                    value.length >= 4 &&
+                    value.length <= 10) ||
                 value.length == 4)) {
           // MoePal keeps the last valid label. Embedded URL codes still win.
           owner.link = owner.link.withPasscode(value);
@@ -237,11 +246,25 @@ class LinkParser {
 
   static String? _embeddedCode(String url, Uri uri) {
     final platform = CloudPlatform.fromHost(uri.host);
+    if (platform == CloudPlatform.github) return null;
     if (platform == CloudPlatform.ctfile) {
       return _ctfileCode(uri);
     }
     if (platform == CloudPlatform.feijipan) {
       return _feijipanCode(uri);
+    }
+    if (platform == CloudPlatform.pikpak) {
+      for (final part in _parts(uri)) {
+        final params = _parameters(part.query);
+        for (final key in ['pass_code', ..._codeKeys]) {
+          final value = params[key] ?? '';
+          if (RegExp(r'^[A-Za-z0-9]{4,10}$').hasMatch(value) &&
+              _isCode(value)) {
+            return value;
+          }
+        }
+      }
+      return null;
     }
     final lanzou = platform == CloudPlatform.lanzou;
     // VLa: decoded query -> hash-route query -> raw URL -> text labels.
@@ -410,6 +433,9 @@ class LinkParser {
     }
     final parts = _parts(uri);
     return switch (platform) {
+      CloudPlatform.github =>
+        GitHubLink.parse(uri) == null ? null : '${uri.host}${uri.path}',
+      CloudPlatform.pikpak => _pathId(parts, r'^/s/([A-Za-z0-9_-]+)'),
       CloudPlatform.feijipan => _feijipanShareId(uri),
       CloudPlatform.ctfile => _ctfileShareId(uri),
       CloudPlatform.baidu =>

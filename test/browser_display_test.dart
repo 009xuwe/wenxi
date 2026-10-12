@@ -3,6 +3,7 @@ import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:asterlink/core/json.dart';
+import 'package:asterlink/core/operation_progress.dart';
 import 'package:asterlink/data/http.dart';
 import 'package:asterlink/domain/models.dart';
 import 'package:asterlink/ui/cloud_thumbnail.dart';
@@ -55,6 +56,28 @@ class _WaitingDownloadConnector extends BrowserTestConnector {
   }
 }
 
+class _PagedProgressConnector extends BrowserTestConnector {
+  _PagedProgressConnector() : super(CloudPlatform.aliyun);
+  final retry = Completer<void>(), complete = Completer<void>();
+
+  @override
+  Future<List<CloudFile>> list(
+    BrowseSession session,
+    String parentId,
+    Credential? credential,
+  ) async {
+    if (parentId != session.rootId) {
+      OperationProgress.reportFiles(200);
+      await retry.future;
+      RequestScope.checkpoint();
+      OperationProgress.reportFiles(200, waitingForRetry: true);
+      await complete.future;
+      RequestScope.checkpoint();
+    }
+    return super.list(session, parentId, credential);
+  }
+}
+
 void main() {
   final binding = TestWidgetsFlutterBinding.ensureInitialized();
   late ThumbnailHttpClient images;
@@ -103,6 +126,27 @@ void main() {
     await tester.runAsync(() => Future<void>.delayed(Duration.zero));
     await tester.pumpAndSettle();
   }
+
+  browserTest(
+    'Aliyun folder loading shows file counts and rate limit waiting',
+    (tester) async {
+      final value = await fixture(tester, platform: CloudPlatform.aliyun);
+      final connector = _PagedProgressConnector();
+      value.services.cloud.connectors[CloudPlatform.aliyun] = connector;
+      await value.render(tester);
+      await tester.tap(find.text('假期相册'));
+      await tester.pump();
+      expect(find.text('正在加载网盘文件…\n已读取 200 项'), findsOneWidget);
+      connector.retry.complete();
+      await tester.pump();
+      expect(find.text('请求较频繁，正在等待重试…\n已读取 200 项'), findsOneWidget);
+      connector.complete.complete();
+      await tester.pumpAndSettle();
+      expect(find.text('旧目录视频.mp4'), findsOneWidget);
+      expect(find.textContaining('已读取 200 项'), findsNothing);
+      expect(tester.takeException(), isNull);
+    },
+  );
 
   for (final mode in [BrowseMode.personal, BrowseMode.share]) {
     browserTest('Baidu $mode download waits for confirmation before enqueue', (
@@ -328,29 +372,46 @@ void main() {
     });
   }
 
-  browserTest('Select all tracks visible files after a search changes', (
-    tester,
-  ) async {
-    final value = await fixture(tester);
-    await value.render(tester);
-    await tester.tap(find.text('多选'));
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('假期相册'));
-    await tester.enterText(find.byType(TextField), '工作');
-    await tester.pumpAndSettle();
-    expect(find.text('全选'), findsOneWidget);
-    await tester.tap(find.text('全选'));
-    await tester.pumpAndSettle();
-    expect(find.text('已选 2 项'), findsOneWidget);
-    await tester.tap(find.text('取消全选'));
-    await tester.pumpAndSettle();
-    expect(find.text('已选 1 项'), findsOneWidget);
-    await tester.tap(find.text('完成'));
-    await tester.pumpAndSettle();
-    expect(find.text('多选'), findsOneWidget);
-    expect(find.text('已选 1 项'), findsNothing);
-    expect(tester.takeException(), isNull);
-  });
+  browserTest(
+    'Changing a dedicated search clears selection before selecting the new results',
+    (tester) async {
+      final value = await fixture(tester);
+      await value.render(tester);
+      await tester.tap(find.byKey(const Key('browser-search-entry')));
+      await tester.pumpAndSettle();
+      await tester.enterText(
+        find.byKey(const Key('browser-search-input')),
+        '旧目录',
+      );
+      await tester.tap(find.byKey(const Key('browser-search-submit')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('多选'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('全选'));
+      await tester.pumpAndSettle();
+      expect(find.text('已选 2 项'), findsOneWidget);
+      await tester.enterText(
+        find.byKey(const Key('browser-search-input')),
+        '工作',
+      );
+      await tester.tap(find.byKey(const Key('browser-search-submit')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('多选'));
+      await tester.pumpAndSettle();
+      expect(find.text('全选'), findsOneWidget);
+      await tester.tap(find.text('全选'));
+      await tester.pumpAndSettle();
+      expect(find.text('已选 1 项'), findsOneWidget);
+      await tester.tap(find.text('取消全选'));
+      await tester.pumpAndSettle();
+      expect(find.text('已选 0 项'), findsOneWidget);
+      await tester.tap(find.text('完成'));
+      await tester.pumpAndSettle();
+      expect(find.text('多选'), findsOneWidget);
+      expect(find.text('已选 1 项'), findsNothing);
+      expect(tester.takeException(), isNull);
+    },
+  );
 
   browserTest(
     'Grid selection and sorting survive display changes and the preference reopens',
@@ -414,7 +475,6 @@ void main() {
         await value.render(tester);
         await tester.tap(find.text('假期相册'));
         await tester.pumpAndSettle();
-        await tester.enterText(find.byType(TextField), '旧目录');
         await tester.longPress(find.text('旧目录视频.mp4'));
         await tester.pumpAndSettle();
         expect(find.text('已选 1 项'), findsOneWidget);
@@ -424,10 +484,8 @@ void main() {
           platform == CloudPlatform.tianyi ? '' : 'root-12002',
         ));
         expect(find.text('已选 1 项'), findsNothing);
-        expect(
-          tester.widget<TextField>(find.byType(TextField)).controller!.text,
-          isEmpty,
-        );
+        expect(find.byKey(const Key('browser-search-entry')), findsOneWidget);
+        expect(find.byKey(const Key('cloud-search-page')), findsNothing);
         expect(find.text('旧目录视频.mp4'), findsNothing);
         expect(find.byTooltip('新建文件夹'), findsNothing);
         await tester.tap(find.byTooltip('02 旅行视频.mp4操作'));

@@ -49,8 +49,8 @@ class FlutterDownloadService : Service() {
         super.onCreate()
         if (Build.VERSION.SDK_INT >= 26) {
             getSystemService(NotificationManager::class.java).createNotificationChannel(
-                NotificationChannel(CHANNEL, "下载任务", NotificationManager.IMPORTANCE_LOW).apply {
-                    description = "后台下载进度与暂停操作"
+                NotificationChannel(CHANNEL, "传输任务", NotificationManager.IMPORTANCE_LOW).apply {
+                    description = "后台下载与上传进度"
                     setShowBadge(false)
                     setSound(null, null)
                     enableVibration(false)
@@ -70,16 +70,17 @@ class FlutterDownloadService : Service() {
     fun show(value: DownloadNotice, allowPause: Boolean = true) {
         if (foreground && lastNotice == value && allowPause) return
         val open = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java),
+            this, 0, Intent(this, MainActivity::class.java).setAction("com.asterlink.app.OPEN_TRANSFERS")
+                .putExtra("transferTab", if (value.active == value.lan && value.lan > 0) "lan" else if (value.uploads > 0) "uploads" else "downloads"),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         val public = NotificationCompat.Builder(this, CHANNEL)
             .setSmallIcon(android.R.drawable.stat_sys_download)
-            .setContentTitle("文析助手 · 后台下载")
+            .setContentTitle("文析助手 · 后台传输")
             .setContentText("点击返回应用").build()
         val builder = NotificationCompat.Builder(this, CHANNEL)
             .setSmallIcon(android.R.drawable.stat_sys_download)
-            .setContentTitle("文析助手 · ${value.active} 个下载任务")
+            .setContentTitle(if (value.active == value.lan && value.lan > 0) "文析助手 · 设备互联" else "文析助手 · ${value.active - value.lan} 个传输任务")
             .setContentText(value.text)
             .setContentIntent(open)
             .setCategory(NotificationCompat.CATEGORY_PROGRESS)
@@ -92,7 +93,7 @@ class FlutterDownloadService : Service() {
                 this, 1, Intent(this, FlutterDownloadService::class.java).setAction("pauseAll"),
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
             )
-            builder.addAction(android.R.drawable.ic_media_pause, "全部暂停", pause)
+            builder.addAction(android.R.drawable.ic_media_pause, if (value.uploads > 0 || value.lan > 0) "停止传输" else "全部暂停", pause)
         }
         val notification = builder.build()
         if (!foreground) {

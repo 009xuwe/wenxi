@@ -76,8 +76,8 @@ class _PlayerRateInputState extends State<PlayerRateInput> {
           enabledBorder: const OutlineInputBorder(
             borderSide: BorderSide(color: Colors.white24),
           ),
-          focusedBorder: const OutlineInputBorder(
-            borderSide: BorderSide(color: playerAccent),
+          focusedBorder: OutlineInputBorder(
+            borderSide: BorderSide(color: playerAccent(context)),
           ),
         ),
         onChanged: (_) {
@@ -90,7 +90,7 @@ class _PlayerRateInputState extends State<PlayerRateInput> {
         key: const Key('player-apply-custom-rate'),
         onPressed: busy ? null : apply,
         style: FilledButton.styleFrom(
-          backgroundColor: playerAccent,
+          backgroundColor: playerAccent(context),
           foregroundColor: const Color(0xff18191b),
         ),
         child: Text(busy ? '正在设置' : '应用倍速'),

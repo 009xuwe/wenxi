@@ -112,7 +112,7 @@ class _Server {
 }
 
 void main() {
-  final executable = p.absolute('native/bin/asterlink_gopeed.exe');
+  final executable = gopeedTestExecutable();
   group(
     'Packaged Windows Gopeed integration',
     () {

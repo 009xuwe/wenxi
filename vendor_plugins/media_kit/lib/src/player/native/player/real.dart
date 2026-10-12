@@ -2767,105 +2767,118 @@ Uint8List? _screenshot(_ScreenshotData data) {
   final pointers = args.map<Pointer<Utf8>>((e) {
     return e.toNativeUtf8();
   }).toList();
-  final Pointer<Pointer<Utf8>> arr = calloc.allocate(args.join().length);
+  // mpv consumes a null-terminated argv, not a character buffer.
+  final arr = calloc<Pointer<Utf8>>(args.length + 1);
   for (int i = 0; i < args.length; i++) {
     arr[i] = pointers[i];
   }
-  mpv.mpv_command_ret(
-    ctx,
-    arr.cast(),
-    result.cast(),
-  );
+  try {
+    final status = mpv.mpv_command_ret(
+      ctx,
+      arr.cast(),
+      result.cast(),
+    );
+    if (status < 0) return null;
 
-  Uint8List? image;
+    Uint8List? image;
 
-  if (result.ref.format == generated.mpv_format.MPV_FORMAT_NODE_MAP) {
-    int? w, h, stride;
-    Uint8List? bytes;
+    if (result.ref.format == generated.mpv_format.MPV_FORMAT_NODE_MAP) {
+      int? w, h, stride;
+      Uint8List? bytes;
 
-    final map = result.ref.u.list;
-    for (int i = 0; i < map.ref.num; i++) {
-      final key = map.ref.keys[i].cast<Utf8>().toDartString();
-      final value = map.ref.values[i];
-      switch (value.format) {
-        case generated.mpv_format.MPV_FORMAT_INT64:
-          switch (key) {
-            case 'w':
-              w = value.u.int64;
+      final map = result.ref.u.list;
+      for (int i = 0; i < map.ref.num; i++) {
+        final key = map.ref.keys[i].cast<Utf8>().toDartString();
+        final value = map.ref.values[i];
+        switch (value.format) {
+          case generated.mpv_format.MPV_FORMAT_INT64:
+            switch (key) {
+              case 'w':
+                w = value.u.int64;
+                break;
+              case 'h':
+                h = value.u.int64;
+                break;
+              case 'stride':
+                stride = value.u.int64;
+                break;
+            }
+            break;
+          case generated.mpv_format.MPV_FORMAT_BYTE_ARRAY:
+            switch (key) {
+              case 'data':
+                final data = value.u.ba.ref.data.cast<Uint8>();
+                bytes = data.asTypedList(value.u.ba.ref.size);
+                break;
+            }
+            break;
+        }
+      }
+
+      if (w != null &&
+          h != null &&
+          stride != null &&
+          bytes != null &&
+          w > 0 &&
+          h > 0 &&
+          w <= 8192 &&
+          h <= 8192 &&
+          w * h <= 16 * 1024 * 1024 &&
+          stride >= w * 4 &&
+          bytes.length >= stride * (h - 1) + w * 4) {
+        switch (format) {
+          case 'image/jpeg':
+            {
+              final pixels = Image(
+                width: w,
+                height: h,
+                numChannels: 3,
+              );
+              for (final pixel in pixels) {
+                final x = pixel.x;
+                final y = pixel.y;
+                final i = (y * stride) + (x * 4);
+                pixel.b = bytes[i];
+                pixel.g = bytes[i + 1];
+                pixel.r = bytes[i + 2];
+              }
+              image = encodeJpg(pixels);
               break;
-            case 'h':
-              h = value.u.int64;
+            }
+          case 'image/png':
+            {
+              final pixels = Image(
+                width: w,
+                height: h,
+                numChannels: 3,
+              );
+              for (final pixel in pixels) {
+                final x = pixel.x;
+                final y = pixel.y;
+                final i = (y * stride) + (x * 4);
+                pixel.b = bytes[i];
+                pixel.g = bytes[i + 1];
+                pixel.r = bytes[i + 2];
+              }
+              image = encodePng(pixels);
               break;
-            case 'stride':
-              stride = value.u.int64;
+            }
+          case null:
+            {
+              image = bytes.sublist(0);
               break;
-          }
-          break;
-        case generated.mpv_format.MPV_FORMAT_BYTE_ARRAY:
-          switch (key) {
-            case 'data':
-              final data = value.u.ba.ref.data.cast<Uint8>();
-              bytes = data.asTypedList(value.u.ba.ref.size);
-              break;
-          }
-          break;
+            }
+        }
       }
     }
 
-    if (w != null && h != null && stride != null && bytes != null) {
-      switch (format) {
-        case 'image/jpeg':
-          {
-            final pixels = Image(
-              width: w,
-              height: h,
-              numChannels: 3,
-            );
-            for (final pixel in pixels) {
-              final x = pixel.x;
-              final y = pixel.y;
-              final i = (y * stride) + (x * 4);
-              pixel.b = bytes[i];
-              pixel.g = bytes[i + 1];
-              pixel.r = bytes[i + 2];
-            }
-            image = encodeJpg(pixels);
-            break;
-          }
-        case 'image/png':
-          {
-            final pixels = Image(
-              width: w,
-              height: h,
-              numChannels: 3,
-            );
-            for (final pixel in pixels) {
-              final x = pixel.x;
-              final y = pixel.y;
-              final i = (y * stride) + (x * 4);
-              pixel.b = bytes[i];
-              pixel.g = bytes[i + 1];
-              pixel.r = bytes[i + 2];
-            }
-            image = encodePng(pixels);
-            break;
-          }
-        case null:
-          {
-            image = bytes.sublist(0);
-            break;
-          }
-      }
-    }
+    return image;
+  } finally {
+    pointers.forEach(calloc.free);
+    mpv.mpv_free_node_contents(result.cast());
+    calloc.free(arr);
+    calloc.free(result.cast());
   }
-
-  pointers.forEach(calloc.free);
-  mpv.mpv_free_node_contents(result.cast());
-
-  calloc.free(arr);
-  calloc.free(result.cast());
-
-  return image;
 }
 
 class _GetPlaylistData {

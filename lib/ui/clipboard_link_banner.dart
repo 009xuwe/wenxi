@@ -17,16 +17,16 @@ class ClipboardLinkBanner extends StatelessWidget {
   Widget build(BuildContext context) => Padding(
     padding: const EdgeInsets.fromLTRB(16, 10, 16, 8),
     child: Material(
-      color: brandBlue.withValues(alpha: .08),
+      color: themeAccent(context).withValues(alpha: .08),
       borderRadius: BorderRadius.circular(12),
       child: Padding(
         padding: const EdgeInsets.fromLTRB(14, 10, 4, 10),
         child: Row(
           children: [
-            const Icon(
+            Icon(
               CupertinoIcons.doc_on_clipboard,
               size: 20,
-              color: brandBlue,
+              color: themeAccent(context),
             ),
             const SizedBox(width: 10),
             Expanded(

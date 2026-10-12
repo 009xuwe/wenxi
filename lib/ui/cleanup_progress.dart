@@ -23,7 +23,7 @@ class CleanupProgress extends StatelessWidget {
         margin: const EdgeInsets.fromLTRB(16, 6, 16, 6),
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
         decoration: BoxDecoration(
-          color: brandBlue.withValues(alpha: .06),
+          color: themeAccent(context).withValues(alpha: .06),
           borderRadius: BorderRadius.circular(10),
         ),
         child: const Row(

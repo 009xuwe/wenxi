@@ -76,6 +76,55 @@ void main() {
       expect(store.data.boolean('after'), isTrue);
     },
   );
+
+  test(
+    'unchanged state preserves encrypted files and does not notify observers',
+    () async {
+      final directory = await Directory.systemTemp.createTemp(
+        'aster-state-noop-',
+      );
+      addTearDown(() => directory.delete(recursive: true));
+      final key = CryptoBox.random(32);
+      final store = await StateStore.open(directory, testKey: key);
+      await store.put('settings', {
+        'nested': [
+          1,
+          2,
+          {'value': 'kept'},
+        ],
+      });
+      await store.put('counter', 7);
+      final file = File('${directory.path}/state-v1.enc');
+      final backup = File('${file.path}.bak');
+      final before = await file.readAsBytes(),
+          beforeBackup = await backup.readAsBytes();
+      var changes = 0;
+      store.addListener(() => changes++);
+      final value = await store.change((draft) {
+        draft['settings'] = {
+          'nested': [
+            1,
+            2,
+            {'value': 'kept'},
+          ],
+        };
+        return draft.integer('counter');
+      });
+      expect(value, 7);
+      expect(changes, 0);
+      expect(await file.readAsBytes(), before);
+      expect(await backup.readAsBytes(), beforeBackup);
+      await store.put('counter', 8);
+      expect(changes, 1);
+      expect(
+        (await StateStore.open(
+          directory,
+          testKey: key,
+        )).data.integer('counter'),
+        8,
+      );
+    },
+  );
   test(
     'Unrecognized future state schema is not silently replaced by an older backup',
     () async {

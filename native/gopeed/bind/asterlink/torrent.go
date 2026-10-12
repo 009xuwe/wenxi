@@ -269,13 +269,13 @@ func beginTorrent(input request) error {
 	}
 	chosen := info.Files[input.TorrentIndex]
 	corebt.SetAsterLinkLimit(input.SpeedLimit)
-	dir := filepath.Join(payloadRoot, input.ID)
-	if err = os.MkdirAll(dir, 0700); err != nil {
+	dir, err := taskPayloadDirectory(input)
+	if err != nil {
 		return err
 	}
 	if taskID, ok := taskIDs[input.ID]; ok {
 		task := core.GetTask(taskID)
-		if task != nil && task.Protocol == "bt" && task.Meta.Res != nil && task.Meta.Res.Hash == info.Hash && task.Meta.Opts != nil && len(task.Meta.Opts.SelectFiles) == 1 && task.Meta.Opts.SelectFiles[0] == input.TorrentIndex {
+		if task != nil && task.Protocol == "bt" && task.Meta.Res != nil && task.Meta.Res.Hash == info.Hash && task.Meta.Opts != nil && filepath.Clean(task.Meta.Opts.Path) == dir && len(task.Meta.Opts.SelectFiles) == 1 && task.Meta.Opts.SelectFiles[0] == input.TorrentIndex {
 			if err = core.PauseAndSave(taskID); err != nil {
 				return err
 			}

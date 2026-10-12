@@ -21,7 +21,7 @@ class UpdateDownloads extends ChangeNotifier implements DownloadManager {
   @override
   DownloadTask? task(String id) => records.where((t) => t.id == id).firstOrNull;
   @override
-  Future<String> enqueue(DownloadSpec spec) async {
+  Future<String> enqueue(DownloadSpec spec, {int? connections}) async {
     final id = 'update-${++created}';
     records.add(
       DownloadTask(id: id, spec: spec, createdAt: created, total: 1024),

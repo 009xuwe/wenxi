@@ -135,6 +135,7 @@ class LoginCredentials {
     return switch (p) {
       CloudPlatform.lanzou => plausible(p, c.primary),
       CloudPlatform.aliyun ||
+      CloudPlatform.pikpak ||
       CloudPlatform.feijipan ||
       CloudPlatform.guangya ||
       CloudPlatform.ilanzou ||
@@ -180,14 +181,27 @@ class LoginCredentials {
   /// Return the saved Cookie header without exporting passwords, token JSON,
   /// browser metadata, or a token-only primary field.
   static String? savedCookie(CloudPlatform platform, Credential? credential) {
-    if (credential == null) return null;
-    final raw = WebTokens.supports(platform) || platform == CloudPlatform.pan123
+    if (credential == null || platform == CloudPlatform.github) return null;
+    final primary =
+        WebTokens.supports(platform) || platform == CloudPlatform.pan123
         ? credential.field('cookie')
         : switch (platform) {
             CloudPlatform.tianyi => TianyiWebLogin.cookie(credential.primary),
             CloudPlatform.weiyun => WeiyunWebLogin.cookie(credential.primary),
             _ => credential.primary,
           };
+    for (final raw in [
+      primary,
+      credential.field('cookie'),
+      WebTokens.decode(credential.primary).str('cookie'),
+    ]) {
+      final value = _savedCookieHeader(platform, raw);
+      if (value != null) return value;
+    }
+    return null;
+  }
+
+  static String? _savedCookieHeader(CloudPlatform platform, String raw) {
     final value = raw
         .trim()
         .replaceFirst(RegExp(r'^Cookie:\s*', caseSensitive: false), '')
@@ -294,6 +308,9 @@ class LoginCredentials {
   }
 
   static bool plausible(CloudPlatform platform, String raw) {
+    if (platform == CloudPlatform.github) {
+      return RegExp(r'^[A-Za-z0-9_]{20,255}$').hasMatch(raw.trim());
+    }
     if (WebTokens.supports(platform)) {
       return WebTokens.fields(platform, raw).isNotEmpty;
     }
@@ -350,6 +367,14 @@ class LoginCredentials {
 
   static String normalize(CloudPlatform p, String raw) {
     var value = raw.trim();
+    if (p == CloudPlatform.github) {
+      value = value.replaceFirst(
+        RegExp(r'^(?:Bearer|token)\s+', caseSensitive: false),
+        '',
+      );
+      require(plausible(p, value), hint(p));
+      return value;
+    }
     if (p == CloudPlatform.tianyi) {
       value = TianyiWebLogin.encode(
         mergeCookies([TianyiWebLogin.cookie(value)]),
@@ -397,7 +422,9 @@ class LoginCredentials {
   ) {
     final value = normalize(p, raw);
     final fields = switch (p) {
+      CloudPlatform.github => {'primary': value, 'authType': 'githubToken'},
       CloudPlatform.feijipan => WebTokens.fields(p, value),
+      CloudPlatform.pikpak => WebTokens.fields(p, value),
       CloudPlatform.aliyun ||
       CloudPlatform.guangya ||
       CloudPlatform.ilanzou ||
@@ -430,6 +457,9 @@ class LoginCredentials {
   }
 
   static String hint(CloudPlatform p) => switch (p) {
+    CloudPlatform.github => '请粘贴 GitHub 个人访问令牌；管理文件需要所选仓库的 Contents 读写权限',
+    CloudPlatform.pikpak =>
+      '请粘贴 PikPak 的登录令牌 JSON（access_token、refresh_token）；也可切换账号密码登录',
     CloudPlatform.feijipan => '请粘贴小飞机网页登录的 appToken，或包含 appToken 和 uuid 的 JSON',
     CloudPlatform.ctfile => '请粘贴城通网盘「开放接口登录密钥管理」中的 Session Token；也可切换邮箱密码登录',
     CloudPlatform.pan115 => '请粘贴 115 登录后的完整 Cookie，需包含 UID、CID 和 SEID',
@@ -634,6 +664,7 @@ class AccountLoginService {
       );
       var committed = false;
       final sameSession = switch (p) {
+        CloudPlatform.pikpak ||
         CloudPlatform.aliyun ||
         CloudPlatform.guangya ||
         CloudPlatform.feijipan ||
@@ -815,6 +846,17 @@ class WebLoginTarget {
       localStorageKey: 'vuex',
       storageOrigins: ['https://feijipan.com', 'https://share.feijipan.com'],
     ),
+    CloudPlatform.pikpak: WebLoginTarget(
+      CloudPlatform.pikpak,
+      'https://mypikpak.com/drive/all',
+      [
+        'https://mypikpak.com',
+        'https://user.mypikpak.com',
+        'https://api-drive.mypikpak.com',
+      ],
+      localStorageKey: 'credentials',
+      storageOrigins: ['https://www.mypikpak.com'],
+    ),
     CloudPlatform.weiyun: WebLoginTarget(
       CloudPlatform.weiyun,
       'https://www.weiyun.com/disk',
@@ -842,6 +884,25 @@ class WebLoginTarget {
     ),
   };
   String get readStorageScript {
+    if (platform == CloudPlatform.pikpak) {
+      return r'''(() => {
+        for (const storage of [localStorage, sessionStorage]) {
+          const sub = storage.getItem('current_sub');
+          const keys = sub ? ['credentials@' + sub, 'credentials', 'token'] : ['credentials', 'token'];
+          for (const key of keys) {
+            try {
+              const raw = storage.getItem(key);
+              if (!raw) continue;
+              const data = JSON.parse(raw);
+              if (!(data.access_token || data.refresh_token || data.accessToken || data.refreshToken)) continue;
+              if (sub && data.sub && String(data.sub) !== sub) continue;
+              return JSON.stringify(data);
+            } catch (_) {}
+          }
+        }
+        return '';
+      })()''';
+    }
     if (platform == CloudPlatform.xunlei) return XunleiWebLogin.readScript;
     final key = jsonEncode(localStorageKey);
     if (platform == CloudPlatform.ilanzou ||
@@ -904,6 +965,15 @@ class WebLoginTarget {
   }
 
   String get clearStorageScript {
+    if (platform == CloudPlatform.pikpak) {
+      return r'''(() => {
+        for (const storage of [localStorage, sessionStorage]) {
+          for (const key of Object.keys(storage)) {
+            if (key === 'credentials' || key.startsWith('credentials@') || key === 'current_sub' || key === 'token') storage.removeItem(key);
+          }
+        }
+      })()''';
+    }
     if (platform == CloudPlatform.xunlei) return XunleiWebLogin.clearScript;
     final key = jsonEncode(localStorageKey);
     if (platform == CloudPlatform.ilanzou ||

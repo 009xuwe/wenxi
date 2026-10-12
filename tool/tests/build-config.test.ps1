@@ -31,10 +31,30 @@ try {
     $count++
     $configured = Get-AsterLinkBuildSettings -ProjectPath $projectPath -BuildConfig $source -ConfigUrl 'https://config.example.test/control.json'
     if (-not $configured.controlEnabled) { throw 'An explicit valid config URL must enable configuration.' }
+    if ($configured.announcementsUrl -ne 'https://config.example.test/announcements.json') { throw 'The independent announcement URL was not derived from the configured directory.' }
+    if ($settings.announcementsUrl) { throw 'Unconfigured builds must not use an author announcement endpoint.' }
     $count++
     $offline = Get-AsterLinkBuildSettings -ProjectPath $projectPath -BuildConfig $source -ConfigUrl 'https://config.example.test/control.json' -Offline
-    if ($offline.controlEnabled -or $offline.githubRepository) { throw 'Offline builds must not check either update source.' }
+    if ($offline.controlEnabled -or $offline.githubRepository -or $offline.announcementsUrl) { throw 'Offline builds must not check updates or announcements.' }
     $count++
+    $customAnnouncements = [IO.File]::ReadAllText($source) | ConvertFrom-Json
+    $customAnnouncements.announcementsUrl = 'https://news.example.test/messages.json'
+    $customPath = Join-Path $stage 'announcement-config.json'
+    [IO.File]::WriteAllText($customPath, ($customAnnouncements | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+    $custom = Get-AsterLinkBuildSettings -ProjectPath $projectPath -BuildConfig $customPath
+    if ($custom.announcementsUrl -ne $customAnnouncements.announcementsUrl) { throw 'The custom announcement endpoint was ignored.' }
+    $customOffline = Get-AsterLinkBuildSettings -ProjectPath $projectPath -BuildConfig $customPath -Offline
+    if ($customOffline.announcementsUrl) { throw 'An offline build retained its custom announcement endpoint.' }
+    $count++
+    foreach ($badAnnouncementsUrl in @('http://news.example.test/feed.json', 'https://news.example.test/feed.json#fragment', 'https://user:pass@news.example.test/feed.json')) {
+        $customAnnouncements.announcementsUrl = $badAnnouncementsUrl
+        [IO.File]::WriteAllText($customPath, ($customAnnouncements | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+        $rejected = $false
+        try { Get-AsterLinkBuildSettings -ProjectPath $projectPath -BuildConfig $customPath | Out-Null }
+        catch { $rejected = $true }
+        if (-not $rejected) { throw 'An unsafe announcement endpoint was accepted.' }
+        $count++
+    }
     foreach ($invalidUrl in @('http://config.example.test/a', 'https://config.example.test/a#fragment', 'https://name:pass@config.example.test/a')) {
         $rejected = $false
         try { Get-AsterLinkBuildSettings -ProjectPath $projectPath -BuildConfig $source -ConfigUrl $invalidUrl | Out-Null }

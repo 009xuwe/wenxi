@@ -12,6 +12,7 @@ import '../data/providers/pan123.dart';
 import '../data/providers/lanzou.dart';
 import '../data/providers/ctfile.dart';
 import '../data/providers/feijipan.dart';
+import '../data/providers/pikpak.dart';
 import '../data/providers/tianyi_captcha.dart';
 import '../data/providers/tianyi_login.dart';
 import '../diagnostics/app_log.dart';
@@ -34,6 +35,7 @@ class NativePasswordLoginPage extends StatefulWidget {
              platform == CloudPlatform.lanzou ||
              platform == CloudPlatform.ctfile ||
              platform == CloudPlatform.feijipan ||
+             platform == CloudPlatform.pikpak ||
              platform == CloudPlatform.tianyi ||
              platform == CloudPlatform.aliyun ||
              platform == CloudPlatform.ilanzou ||
@@ -76,6 +78,7 @@ class _NativePasswordLoginPageState extends State<NativePasswordLoginPage> {
       _password.text = saved.field('password');
     } else if (widget.platform == CloudPlatform.guangya ||
         widget.platform == CloudPlatform.feijipan ||
+        widget.platform == CloudPlatform.pikpak ||
         widget.platform == CloudPlatform.ilanzou) {
       _username.text = saved?.field('username') ?? '';
       _password.text = saved?.field('password') ?? '';
@@ -135,6 +138,10 @@ class _NativePasswordLoginPageState extends State<NativePasswordLoginPage> {
         return;
       }
       await services.login.submit(platform, (_) async {
+        if (platform == CloudPlatform.pikpak) {
+          return (services.cloud.connector(platform) as PikPakConnector)
+              .password(username, password);
+        }
         if (platform == CloudPlatform.feijipan) {
           return (services.cloud.connector(platform) as FeijipanConnector)
               .password(username, password);
@@ -283,7 +290,9 @@ class _NativePasswordLoginPageState extends State<NativePasswordLoginPage> {
                       autofillHints: const [AutofillHints.username],
                       decoration: InputDecoration(
                         labelText: '账号',
-                        hintText: platform == CloudPlatform.ctfile
+                        hintText: platform == CloudPlatform.pikpak
+                            ? '邮箱 / 手机号（含国家区号）'
+                            : platform == CloudPlatform.ctfile
                             ? '注册邮箱'
                             : platform == CloudPlatform.lanzou
                             ? '蓝奏云用户名 / 账号'
@@ -349,12 +358,12 @@ class _NativePasswordLoginPageState extends State<NativePasswordLoginPage> {
                         minimumSize: const Size.fromHeight(50),
                       ),
                       child: _working
-                          ? const SizedBox(
+                          ? SizedBox(
                               width: 22,
                               height: 22,
                               child: CircularProgressIndicator(
                                 strokeWidth: 2,
-                                color: Colors.white,
+                                color: themeOnAccent(context),
                               ),
                             )
                           : const Text('登录'),
@@ -364,6 +373,8 @@ class _NativePasswordLoginPageState extends State<NativePasswordLoginPage> {
                       _working
                           ? _status
                           : switch (platform) {
+                              CloudPlatform.pikpak =>
+                                '登录令牌加密保存在本机并自动续期；遇到安全验证可切换网页登录',
                               CloudPlatform.ctfile =>
                                 '支持注册邮箱登录；登录凭据加密保存在本机，过期后请重新登录',
                               CloudPlatform.lanzou =>
@@ -745,11 +756,11 @@ class _TianyiCaptchaDialogState extends State<TianyiCaptchaDialog> {
                           child: IgnorePointer(
                             child: CircleAvatar(
                               radius: 13,
-                              backgroundColor: brandBlue,
+                              backgroundColor: themeAccent(context),
                               child: Text(
                                 '${i + 1}',
-                                style: const TextStyle(
-                                  color: Colors.white,
+                                style: TextStyle(
+                                  color: themeOnAccent(context),
                                   fontSize: 13,
                                 ),
                               ),
@@ -802,12 +813,12 @@ class _TianyiCaptchaDialogState extends State<TianyiCaptchaDialog> {
                           child: Container(
                             width: 44 * scale,
                             decoration: BoxDecoration(
-                              color: brandBlue,
+                              color: themeAccent(context),
                               borderRadius: BorderRadius.circular(10),
                             ),
-                            child: const Icon(
+                            child: Icon(
                               CupertinoIcons.chevron_right_2,
-                              color: Colors.white,
+                              color: themeOnAccent(context),
                               size: 19,
                             ),
                           ),

@@ -17,6 +17,7 @@ class _AliSpaces extends BrowserTestConnector {
   Future<List<CloudSpace>> personalSpaces(Credential c) async => const [
     CloudSpace('resource', '资源库'),
     CloudSpace('backup', '备份盘'),
+    CloudSpace('album', '相册'),
   ];
   @override
   Future<BrowseSession> openPersonalSpace(
@@ -280,7 +281,6 @@ void main() {
           );
           await tester.tap(find.text('假期相册'));
           await tester.pumpAndSettle();
-          await tester.enterText(find.byType(TextField), '旧目录');
           await tester.longPress(find.text('旧目录视频.mp4'));
           await tester.pumpAndSettle();
           await tester.tap(
@@ -290,13 +290,20 @@ void main() {
           await tester.tap(find.text('备份盘'));
           await tester.pumpAndSettle();
           expect(connector.drivesRead.last, 'backup');
-          expect(
-            tester.widget<TextField>(find.byType(TextField)).controller!.text,
-            isEmpty,
-          );
+          expect(find.text('旧目录视频.mp4'), findsNothing);
           expect(find.text('已选 1 项'), findsNothing);
           expect(find.text('假期相册'), findsOneWidget);
           expect(find.text('备份盘 ▾'), findsOneWidget);
+
+          await tester.tap(
+            find.byKey(const ValueKey('personal-space-selector')),
+          );
+          await tester.pumpAndSettle();
+          await tester.tap(find.text('相册'));
+          await tester.pumpAndSettle();
+          expect(connector.drivesRead.last, 'album');
+          expect(find.text('相册 ▾'), findsOneWidget);
+          expect(find.text('假期相册'), findsOneWidget);
 
           await tester.pumpWidget(const SizedBox.shrink());
           String? chosen;

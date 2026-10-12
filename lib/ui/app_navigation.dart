@@ -1,4 +1,7 @@
 import 'liquid_bottom_navigation.dart';
+import 'navigation_transfer_icon.dart';
+import '../download/navigation_transfers.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_svg/flutter_svg.dart';
 import 'common.dart';
@@ -9,25 +12,26 @@ class AppNavigation extends StatelessWidget {
     required this.selectedIndex,
     required this.onSelected,
     this.rail = false,
+    this.transfers,
   });
 
   final int selectedIndex;
   final ValueChanged<int> onSelected;
   final bool rail;
+  final ValueListenable<NavigationTransferStatus>? transfers;
 
   static const destinations = [
     ('解析', 'assets/navigation/parse.svg'),
     ('网盘', 'assets/navigation/cloud.svg'),
-    ('下载', 'assets/navigation/downloads.svg'),
+    ('传输', 'assets/navigation/downloads.svg'),
     ('我的', 'assets/navigation/settings.svg'),
   ];
 
   @override
   Widget build(BuildContext context) {
-    final dark = Theme.of(context).brightness == Brightness.dark;
     final compact = rail && MediaQuery.sizeOf(context).height < 560;
-    final active = dark ? const Color(0xff64b5ff) : const Color(0xff006bdb);
-    final inactive = dark ? const Color(0xffb8beca) : const Color(0xff606774);
+    final active = themeAccent(context);
+    final inactive = Theme.of(context).colorScheme.onSurfaceVariant;
 
     Widget item(int index) {
       final (label, asset) = destinations[index];
@@ -40,8 +44,8 @@ class AppNavigation extends StatelessWidget {
         selected: selected,
         button: true,
         onTap: activate,
-        excludeSemantics: true,
         child: InkWell(
+          excludeFromSemantics: true,
           onTap: activate,
           customBorder: const StadiumBorder(),
           splashColor: active.withValues(alpha: .12),
@@ -57,23 +61,33 @@ class AppNavigation extends StatelessWidget {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  SvgPicture.asset(
-                    asset,
-                    width: 26,
-                    height: 26,
-                    colorFilter: ColorFilter.mode(color, BlendMode.srcIn),
-                    excludeFromSemantics: true,
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    label,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontSize: 12,
-                      height: 1.15,
-                      fontWeight: FontWeight.w600,
+                  if (index == 2)
+                    NavigationTransferIcon(
+                      asset: asset,
                       color: color,
+                      size: 26,
+                      transfers: transfers,
+                    )
+                  else
+                    SvgPicture.asset(
+                      asset,
+                      width: 26,
+                      height: 26,
+                      colorFilter: ColorFilter.mode(color, BlendMode.srcIn),
+                      excludeFromSemantics: true,
+                    ),
+                  const SizedBox(height: 4),
+                  ExcludeSemantics(
+                    child: Text(
+                      label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 12,
+                        height: 1.15,
+                        fontWeight: FontWeight.w600,
+                        color: color,
+                      ),
                     ),
                   ),
                 ],
@@ -128,6 +142,7 @@ class AppNavigation extends StatelessWidget {
       selectedIndex: selectedIndex,
       onSelected: onSelected,
       destinations: destinations,
+      transfers: transfers,
     );
   }
 }

@@ -25,7 +25,7 @@ class StateRecoveryRequired extends AppException {
   const StateRecoveryRequired(this.directory, this.cause)
     : super(
         cause == StateRecoveryCause.secureStorageUnavailable
-            ? '暂时无法访问系统安全存储，请先解锁设备后重试。原文件已保留，也可以尝试下方的恢复方式。'
+            ? '系统安全存储读取失败，可能是设备存储兼容或密钥访问异常。原文件已保留，请重试；仍无法进入时，可使用下方的恢复方式。'
             : '本地账号和设置暂时无法读取，原文件已保留。可以尝试下方的恢复方式。',
       );
   final Directory directory;
@@ -51,39 +51,60 @@ class StateStore extends ChangeNotifier {
     Directory directory, {
     Uint8List? testKey,
     FlutterSecureStorage storage = secureStorage,
+    LocalStateKey? localKey,
   }) async {
     await directory.create(recursive: true);
     final file = File('${directory.path}${Platform.pathSeparator}state-v1.enc');
     final backup = File('${file.path}.bak');
     final pending = File('${file.path}.tmp');
-    final localKey = testKey == null ? LocalStateKey(directory, storage) : null;
+    localKey = testKey == null
+        ? (localKey ?? LocalStateKey(directory, storage))
+        : null;
     final saved = await localKey?.read();
     final keys = testKey != null ? [testKey] : saved!.keys;
+    List<StateKeyFallback>? fallbackKeys;
+    Future<List<StateKeyFallback>> fallbacks() async =>
+        fallbackKeys ??= await localKey?.readFallbacks() ?? [];
+    StateKeyFallback? usedFallback;
     if (keys.isEmpty) {
       final cause = saved!.unavailable
           ? StateRecoveryCause.secureStorageUnavailable
           : saved.invalid
           ? StateRecoveryCause.invalidKey
           : StateRecoveryCause.missingKey;
-      if (saved.unavailable ||
-          saved.invalid ||
-          await file.exists() ||
-          await backup.exists() ||
-          await pending.exists() ||
-          await localKey!.canUnlock()) {
+      final hasFallback = (await fallbacks()).isNotEmpty;
+      if (!hasFallback &&
+          (saved.unavailable ||
+              saved.invalid ||
+              await file.exists() ||
+              await backup.exists() ||
+              await pending.exists() ||
+              await localKey!.canUnlock())) {
         throw StateRecoveryRequired(directory, cause);
       }
-      final generated = CryptoBox.random(32);
-      await localKey.save(generated);
-      keys.add(generated);
+      if (!hasFallback) {
+        final generated = CryptoBox.random(32);
+        if (localKey!.nativeAndroid) {
+          await localKey.saveFresh(generated);
+        } else {
+          await localKey.save(generated);
+        }
+        keys.add(generated);
+      }
     }
-    Uint8List key = keys.first;
+    Uint8List? key = keys.firstOrNull;
     Json data = {};
     final candidates = [file, backup, pending];
+    final fallbackSnapshot = await file.exists()
+        ? file.path
+        : await pending.exists()
+        ? pending.path
+        : backup.path;
     var found = false;
     var recovered = false;
     for (final candidate in candidates) {
       if (!await candidate.exists()) continue;
+      final newestSnapshot = candidate.path == fallbackSnapshot;
       found = true;
       final bytes = await candidate.readAsBytes();
       Json? decoded;
@@ -97,6 +118,22 @@ class StateStore extends ChangeNotifier {
           continue;
         } on FormatException {
           continue;
+        }
+      }
+      // Fallback keys must authenticate the newest available snapshot. Never
+      // let a stale fallback key silently replace it with an older .bak file.
+      if (decoded == null && newestSnapshot) {
+        for (final fallback in await fallbacks()) {
+          try {
+            decoded = await compute(_decryptSnapshot, (fallback.key, bytes));
+            key = fallback.key;
+            usedFallback = fallback;
+            break;
+          } on AppException {
+            continue;
+          } on FormatException {
+            continue;
+          }
         }
       }
       if (decoded == null) continue;
@@ -120,16 +157,26 @@ class StateStore extends ChangeNotifier {
     if (found && !recovered) {
       throw StateRecoveryRequired(directory, StateRecoveryCause.unreadableData);
     }
+    if (key == null) {
+      throw StateRecoveryRequired(directory, StateRecoveryCause.unreadableData);
+    }
     if (!found && localKey != null && await localKey.canUnlock()) {
       throw StateRecoveryRequired(directory, StateRecoveryCause.unreadableData);
     }
-    if (recovered && saved?.needsRepair(key) == true) {
+    if (recovered &&
+        (usedFallback != null || saved?.needsRepair(key) == true)) {
       try {
-        await localKey!.save(key);
+        if (usedFallback != null) {
+          await localKey!.useFallback(usedFallback);
+        } else {
+          await localKey!.save(key);
+        }
       } on PlatformException {
         // Authenticated data is usable even while a secure write is unavailable.
       } on AppException {
         // Keep the usable record; explicit password recovery can rebind storage.
+      } on FileSystemException {
+        // A failed pointer repair must not prevent using authenticated data.
       }
     }
     return StateStore._(file, key, data, localKey);
@@ -145,9 +192,15 @@ class StateStore extends ChangeNotifier {
     T Function(Json draft) edit, {
     String? recoveryPassword,
   }) => _gate.run(() async {
-    final draft = asJson(jsonDecode(jsonEncode(_data)));
+    final previous = jsonEncode(_data);
+    final draft = asJson(jsonDecode(previous));
     final result = edit(draft);
     draft['schema'] = 1;
+    final serialized = jsonEncode(draft);
+    // Startup reconciliation and idle shutdown often leave the state unchanged.
+    // Re-encrypting a large download queue for these no-ops can take seconds.
+    // A backup import must still install its recovery password even if equal.
+    if (recoveryPassword == null && serialized == previous) return result;
     if (file != null) {
       final protectedImport = recoveryPassword != null && _localKey != null;
       final originals = <String, Uint8List?>{};
@@ -171,12 +224,9 @@ class StateStore extends ChangeNotifier {
         Uint8List? envelope;
         if (protectedImport) {
           envelope = await _localKey.prepareRecovery(_key, recoveryPassword);
-          await _localKey.saveFresh(_key);
+          await _localKey.saveForImport(_key);
         }
-        final bytes = await compute(_encryptSnapshot, (
-          _key,
-          jsonEncode(draft),
-        ));
+        final bytes = await compute(_encryptSnapshot, (_key, serialized));
         final temporary = File('${file!.path}.tmp');
         final backup = File('${file!.path}.bak');
         await temporary.writeAsBytes(bytes, flush: true);

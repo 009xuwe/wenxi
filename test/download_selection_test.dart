@@ -439,7 +439,7 @@ void main() {
       final path = services.downloads.task('completed-a')!.savedPath!;
       await tester.runAsync(() => File(path).delete());
       files.failPaths.add(path);
-      await tester.tap(find.text('下载').last);
+      await tester.tap(find.text('传输').last);
       await waitFor(tester, () => find.text('文件不存在').evaluate().isNotEmpty);
       await tester.tap(find.text('文件异常 1'));
       await tester.pumpAndSettle();
@@ -512,7 +512,7 @@ void main() {
       await select(tester, 'completed-a');
       await tester.tap(find.text('网盘').last);
       await tester.pumpAndSettle();
-      await tester.tap(find.text('下载').last);
+      await tester.tap(find.text('传输').last);
       await tester.pumpAndSettle();
       expect(getCount(), findsNothing);
     },

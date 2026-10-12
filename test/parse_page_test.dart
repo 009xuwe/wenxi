@@ -214,7 +214,8 @@ void main() {
       await tester.pump();
       expect(code(tester), 'u123');
       expect(connector.opened, isEmpty);
-      await tester.ensureVisible(find.byTooltip('清空输入'));
+      await tester.ensureVisible(find.byKey(const Key('parse-input')));
+      await tester.pumpAndSettle();
       await tester.tap(find.byTooltip('清空输入'));
       await tester.pump();
       expect(code(tester), isEmpty);
@@ -298,6 +299,11 @@ void main() {
       connector = _ShareConnector(CloudPlatform.baidu);
       services.cloud.connectors[CloudPlatform.baidu] = connector;
       await enter(tester, loginText);
+      await tester.ensureVisible(
+        find.byKey(const ValueKey('baidu-route-account')),
+      );
+      await tester.tap(find.byKey(const ValueKey('baidu-route-account')));
+      await tester.pumpAndSettle();
       await start(tester);
       expect(find.text('去配置'), findsOneWidget);
       expect(connector.opened, isEmpty);
@@ -421,7 +427,7 @@ void main() {
       expect(find.byType(BrowserPage), findsOneWidget);
       expect(find.byType(WebLoginPage), findsNothing);
       expect(find.byType(NativePasswordLoginPage), findsNothing);
-      expect(find.byTooltip('切换或更新账号'), findsNothing);
+      expect(find.byKey(const Key('browser-account-menu')), findsOneWidget);
       expect(services.vault.credential(CloudPlatform.lanzou), isNull);
       expect(fixture.http.calls, hasLength(3));
       expect(services.store.data.list('history'), hasLength(1));
@@ -454,7 +460,7 @@ void main() {
       await start(tester);
       expect(find.byType(BrowserPage), findsOneWidget);
       expect(find.byType(WebLoginPage), findsNothing);
-      expect(find.byTooltip('切换或更新账号'), findsNothing);
+      expect(find.byKey(const Key('browser-account-menu')), findsOneWidget);
       expect(find.text('Example & 1.zip'), findsOneWidget);
       await tester.tap(find.widgetWithText(ListTile, '子目录'));
       await tester.pumpAndSettle();

@@ -3,6 +3,7 @@ import 'dart:math' as math;
 import 'package:crypto/crypto.dart';
 import '../../core/json.dart';
 import '../../domain/auth.dart';
+import '../../domain/baidu_share_route.dart';
 import '../../domain/models.dart';
 import '../../domain/uploads.dart';
 import '../http.dart';
@@ -12,6 +13,7 @@ import '../../core/operation_progress.dart';
 import '../../diagnostics/app_log.dart';
 import 'baidu_link_service.dart';
 import 'baidu_app_client.dart';
+import 'baidu_public_parser.dart';
 
 class _BaiduFileMissing extends AppException {
   const _BaiduFileMissing() : super('百度文件或分享已失效');
@@ -24,12 +26,15 @@ class BaiduConnector extends CloudConnector {
     CredentialStore? store,
     BaiduAppClient? client,
     BaiduLinkLookup? linkLookup,
+    BaiduPublicParser? publicParser,
   }) : _client = client ?? BaiduAppClient(store: store),
-       _linkLookup = linkLookup ?? BaiduLinkService(http).resolve;
+       _linkLookup = linkLookup ?? BaiduLinkService(http).resolve,
+       _publicParser = publicParser ?? BaiduPublicParser(http, store: store);
   final JsonHttp http;
   final BaiduAppClient _client;
   final Future<void> Function(DownloadCleanup)? stageCleanup;
   final BaiduLinkLookup _linkLookup;
+  final BaiduPublicParser _publicParser;
   @override
   CloudPlatform get platform => CloudPlatform.baidu;
   static const defaultAppId = '250528';
@@ -217,8 +222,12 @@ class BaiduConnector extends CloudConnector {
   @override
   Future<BrowseSession> openShare(
     ParsedLink link,
-    Credential? credential,
-  ) async {
+    Credential? credential, {
+    BaiduShareRoute route = BaiduShareRoute.account,
+  }) async {
+    if (route == BaiduShareRoute.publicParser) {
+      return _publicParser.openShare(link);
+    }
     final id = link.shareId;
     require(id?.isNotEmpty == true, '百度分享链接缺少短链接 ID');
     final ck = credential?.primary ?? '';
@@ -240,6 +249,7 @@ class BaiduConnector extends CloudConnector {
       title: result.str('title').ifEmpty('百度分享'),
       rootId: '/',
       metadata: {
+        BaiduShareRoute.metadataKey: BaiduShareRoute.account.key,
         'shortId': id,
         'sekey': sekey,
         'shareId': result.str('share_id'),
@@ -310,7 +320,9 @@ class BaiduConnector extends CloudConnector {
   );
   @override
   Future<List<CloudFile>> list(BrowseSession s, String parent, Credential? c) =>
-      _compatibleList(s, parent, c);
+      BaiduShareRoute.usesPublicParser(s)
+      ? _publicParser.list(s, parent)
+      : _compatibleList(s, parent, c);
 
   Future<List<CloudFile>> _compatibleList(
     BrowseSession s,
@@ -438,7 +450,8 @@ class BaiduConnector extends CloudConnector {
     return files;
   }
 
-  /// 百度网盘下载目前通过中转取链接口获取地址，文件内容仍由客户端直连百度下载。
+  /// 个人网盘和“账号下载”通过中转取链；公益分享通道使用独立解析站。
+  /// 两条通道的文件内容均由客户端直连百度下载。
   /// 因百度网盘接口的特殊性，服务端取链实现暂不开源，避免公开后接口很快失效。
   /// 后续会根据接口稳定性和实际情况考虑开源；此处保留客户端对接与下载流程。
   @override
@@ -448,6 +461,9 @@ class BaiduConnector extends CloudConnector {
     Credential? c,
   ) async {
     require(!file.isDirectory, '文件夹不能直接下载');
+    if (BaiduShareRoute.usesPublicParser(s)) {
+      return _publicParser.download(s, file);
+    }
     if (c == null) throw const AccountLoginRequired('百度下载需要登录账号');
     final account = c, ck = cookie(c), id = appId(c);
     DownloadCleanup? cleanup;
@@ -976,6 +992,15 @@ class BaiduConnector extends CloudConnector {
     Credential c,
   ) async {
     require(s.mode == BrowseMode.share, '请打开分享链接');
+    if (BaiduShareRoute.usesPublicParser(s)) {
+      require(s.sourceLink != null, '原百度分享信息缺失，请重新解析');
+      final ownSession = await openShare(
+        s.sourceLink!,
+        c,
+        route: BaiduShareRoute.account,
+      );
+      return saveShare(ownSession, files, target, c);
+    }
     if (await _ownsShare(s, c)) {
       // Baidu rejects transferring a share back to its owner, even into a
       // different directory. Copy the authenticated owner's original paths.

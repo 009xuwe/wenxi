@@ -34,6 +34,8 @@ const cloudEntries = <(String, String, CloudPlatform?)>[
   ('lanzous', '蓝奏云', CloudPlatform.lanzou),
   ('ctfile', '城通网盘', CloudPlatform.ctfile),
   ('feijipan', '小飞机网盘', CloudPlatform.feijipan),
+  ('pikpak', 'PikPak网盘', CloudPlatform.pikpak),
+  ('github', 'GitHub', CloudPlatform.github),
 ];
 
 class CloudPage extends StatelessWidget {
@@ -69,7 +71,8 @@ class CloudPage extends StatelessWidget {
         ) ||
         services.accountNeedsLogin.contains(platform)) {
       await openLogin(context, services, platform);
-      if (platform != CloudPlatform.lanzou ||
+      if (platform != CloudPlatform.lanzou &&
+              platform != CloudPlatform.github ||
           !context.mounted ||
           !LoginCredentials.stored(
             platform,
@@ -209,7 +212,7 @@ class CloudPage extends StatelessWidget {
             !services.accountErrors.containsKey(platform);
     return Container(
       decoration: BoxDecoration(
-        color: Theme.of(context).colorScheme.surface,
+        color: backgroundSurface(context),
         borderRadius: BorderRadius.circular(12),
         border: Border.all(color: border(context), width: .6),
         boxShadow: [
@@ -286,9 +289,9 @@ class CloudPage extends StatelessWidget {
                               customName,
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
+                              style: TextStyle(
                                 fontSize: 12,
-                                color: brandBlue,
+                                color: themeAccent(context),
                               ),
                             ),
                           ),
@@ -355,10 +358,10 @@ class CloudPage extends StatelessWidget {
                               padding: const EdgeInsets.symmetric(vertical: 4),
                               child: Row(
                                 children: [
-                                  const Icon(
+                                  Icon(
                                     CupertinoIcons.arrow_clockwise,
                                     size: 13,
-                                    color: brandBlue,
+                                    color: themeAccent(context),
                                   ),
                                   const SizedBox(width: 4),
                                   Expanded(
@@ -366,9 +369,9 @@ class CloudPage extends StatelessWidget {
                                       services.accountErrors[platform]!,
                                       maxLines: 2,
                                       overflow: TextOverflow.ellipsis,
-                                      style: const TextStyle(
+                                      style: TextStyle(
                                         fontSize: 12,
-                                        color: brandBlue,
+                                        color: themeAccent(context),
                                       ),
                                     ),
                                   ),
@@ -400,10 +403,10 @@ class CloudPage extends StatelessWidget {
                     IconButton(
                       tooltip: '${entry.$2}解析',
                       onPressed: () => _parseLanzou(context),
-                      icon: const Icon(
+                      icon: Icon(
                         CupertinoIcons.link,
                         size: 17,
-                        color: brandBlue,
+                        color: themeAccent(context),
                       ),
                     ),
                   IconButton(

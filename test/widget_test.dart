@@ -241,12 +241,17 @@ void main() {
         expect(find.byType(XunleiLoginPage), findsOneWidget);
         expect(find.text('账号密码'), findsOneWidget);
         expect(find.text('短信登录'), findsOneWidget);
+      } else if (platform == CloudPlatform.github) {
+        expect(find.text('GitHub 登录'), findsOneWidget);
+        expect(find.byKey(const Key('github-token')), findsOneWidget);
+        expect(find.byType(WebLoginPage), findsNothing);
       } else if (platform == CloudPlatform.pan123 ||
           platform == CloudPlatform.tianyi ||
           platform == CloudPlatform.aliyun ||
           platform == CloudPlatform.ilanzou ||
           platform == CloudPlatform.lanzou ||
           platform == CloudPlatform.ctfile ||
+          platform == CloudPlatform.pikpak ||
           platform == CloudPlatform.feijipan) {
         expect(find.byType(NativePasswordLoginPage), findsOneWidget);
         expect(
@@ -533,7 +538,7 @@ void main() {
       expect(find.textContaining('游客下载不限制文件大小'), findsOneWidget);
       expect(services.settings.quarkAuthenticatedDirectDownload, isFalse);
       expect(services.settings.quarkGuestDirectDownload, isFalse);
-      expect(services.settings.ucGuestDirectDownload, isFalse);
+      expect(services.settings.ucGuestDirectDownload, isTrue);
 
       final quarkSwitch = find.byKey(
         const ValueKey('quarkAuthenticatedDirectDownload'),
@@ -544,7 +549,7 @@ void main() {
       });
       await tester.pumpAndSettle();
       expect(tester.widget<SwitchListTile>(quarkSwitch).value, isTrue);
-      expect(services.settings.ucGuestDirectDownload, isFalse);
+      expect(services.settings.ucGuestDirectDownload, isTrue);
       expect(services.settings.quarkGuestDirectDownload, isFalse);
       Navigator.of(tester.element(find.byType(ExperimentalFeaturesPage))).pop();
       await tester.pumpAndSettle();
@@ -578,17 +583,28 @@ void main() {
         tester.getTopLeft(find.text('外观')).dy,
         lessThan(tester.getTopLeft(find.text('下载设置')).dy),
       );
-      await tester.tap(find.text('外观模式'));
+      await tester.tap(find.text('主题与外观'));
       await tester.pumpAndSettle();
-      expect(find.text('跟随系统'), findsOneWidget);
-      await tester.tap(find.text('深色'));
+      expect(
+        find.byKey(const ValueKey('appearance-mode-System')),
+        findsOneWidget,
+      );
+      await tester.ensureVisible(
+        find.byKey(const ValueKey('appearance-mode-Dark')),
+      );
+      await tester.tap(find.byKey(const ValueKey('appearance-mode-Dark')));
+      await tester.pumpAndSettle();
+      expect(services.settings.theme, 'Light');
+      await tester.tap(find.byKey(const Key('appearance-apply')));
       await tester.pumpAndSettle();
       await tester.runAsync(() async {
         await Future<void>.delayed(const Duration(milliseconds: 20));
       });
       await tester.pumpAndSettle();
       expect(services.settings.theme, 'Dark');
-      expect(find.text('外观模式'), findsOneWidget);
+      expect(find.text('主题与外观'), findsOneWidget);
+      await tester.tap(find.byType(BackButton));
+      await tester.pumpAndSettle();
       tester.view.physicalSize = const Size(320, 700);
       await changeTextScale(tester, 1.8);
       expect(tester.takeException(), isNull);
@@ -624,7 +640,7 @@ void main() {
       debugDefaultTargetPlatformOverride = TargetPlatform.windows;
       try {
         await render(tester, const Size(1100, 780), 3);
-        expect(find.byType(ChoiceChip), findsNWidgets(3));
+        expect(find.text('主题与外观').hitTestable(), findsOneWidget);
         expect(
           tester.getTopLeft(find.text('外观')).dx,
           greaterThan(tester.getTopLeft(find.text('下载设置')).dx),
@@ -1227,17 +1243,13 @@ void main() {
   ) async {
     await render(tester, const Size(393, 864), 0);
     expect(find.text('分享解析'), findsOneWidget);
-    await tester.tap(find.byTooltip('更多操作'));
+    expect(find.byTooltip('更多操作'), findsNothing);
+    await tester.tap(find.byKey(const Key('parse-announcements')));
     await tester.pumpAndSettle();
-    expect(find.text('软件公告'), findsOneWidget);
+    expect(find.byKey(const Key('announcements-page')), findsOneWidget);
+    expect(find.text('暂无公告'), findsOneWidget);
     expect(find.text('粘贴链接'), findsNothing);
     expect(find.text('新建下载'), findsNothing);
-    await tester.tap(find.text('打赏作者'));
-    await tester.pumpAndSettle();
-    expect(find.text('谢谢你的支持'), findsOneWidget);
-    expect(find.text('保存赞赏码'), findsOneWidget);
-    expect(find.bySemanticsLabel('微信赞赏码'), findsOneWidget);
-    expect(find.text('如果文析助手帮到了你，欢迎给晚风一点支持。'), findsNothing);
     await tester.tap(find.byTooltip('返回').first);
     await tester.pumpAndSettle();
     expect(find.text('分享解析'), findsOneWidget);
@@ -1245,12 +1257,19 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('网盘列表'), findsOneWidget);
     expect(find.text('夸克网盘'), findsOneWidget);
-    await tester.tap(find.text('下载').last);
+    await tester.tap(find.byKey(const ValueKey('navigation-2')));
     await tester.pumpAndSettle();
-    expect(find.text('下载管理'), findsOneWidget);
+    expect(find.text('传输管理'), findsOneWidget);
     await tester.tap(find.text('我的').last);
     await tester.pumpAndSettle();
     expect(find.text('HTTP 下载连接数'), findsOneWidget);
+    await tester.tap(find.byTooltip('更多操作'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('打赏作者'));
+    await tester.pumpAndSettle();
+    expect(find.text('谢谢你的支持'), findsOneWidget);
+    expect(find.text('保存赞赏码'), findsOneWidget);
+    expect(find.bySemanticsLabel('微信赞赏码'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
   testWidgets('Download filtering and details expose safe default deletion', (

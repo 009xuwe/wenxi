@@ -180,18 +180,24 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
           padding: const EdgeInsets.all(16),
           margin: const EdgeInsets.only(bottom: 12),
           decoration: BoxDecoration(
-            color: brandBlue.withValues(
+            color: themeAccent(context).withValues(
               alpha: Theme.of(context).brightness == Brightness.dark
                   ? .16
                   : .08,
             ),
             borderRadius: BorderRadius.circular(14),
-            border: Border.all(color: brandBlue.withValues(alpha: .25)),
+            border: Border.all(
+              color: themeAccent(context).withValues(alpha: .25),
+            ),
           ),
-          child: const Row(
+          child: Row(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Icon(CupertinoIcons.info_circle_fill, color: brandBlue, size: 23),
+              Icon(
+                CupertinoIcons.info_circle_fill,
+                color: themeAccent(context),
+                size: 23,
+              ),
               SizedBox(width: 12),
               Expanded(
                 child: Text(
@@ -322,7 +328,9 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
               entry.level == 'info'
                   ? CupertinoIcons.doc_text
                   : CupertinoIcons.exclamationmark_triangle,
-              color: entry.level == 'info' ? brandBlue : Colors.orange,
+              color: entry.level == 'info'
+                  ? themeAccent(context)
+                  : Colors.orange,
             ),
             title: Text(
               entry.event,

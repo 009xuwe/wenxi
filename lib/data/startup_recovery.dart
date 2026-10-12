@@ -20,9 +20,13 @@ class StartupRecovery {
   const StartupRecovery(
     this.failure, {
     this.storage = StateStore.secureStorage,
+    this.localKey,
   });
   final StateRecoveryRequired failure;
   final FlutterSecureStorage storage;
+  final LocalStateKey? localKey;
+  LocalStateKey get _localKey =>
+      localKey ?? LocalStateKey(failure.directory, storage);
   static const _snapshots = [
     'state-v1.enc',
     'state-v1.enc.bak',
@@ -48,12 +52,11 @@ class StartupRecovery {
   Future<StartupRecoveryResult> reinitialize() =>
       _replace({'schema': 1, 'legacyImported': true});
 
-  Future<bool> canUnlock() =>
-      LocalStateKey(failure.directory, storage).canUnlock();
+  Future<bool> canUnlock() => _localKey.canUnlock();
 
   Future<void> unlock(String password) => _locked(() async {
     await _requireUnreadable();
-    final localKey = LocalStateKey(failure.directory, storage);
+    final localKey = _localKey;
     final key = await localKey.unlock(password);
     try {
       await StateStore.validateRecoveryKey(failure.directory, key);
@@ -63,6 +66,7 @@ class StartupRecovery {
       final reopened = await StateStore.open(
         failure.directory,
         storage: storage,
+        localKey: localKey,
       );
       reopened.dispose();
     } finally {
@@ -75,6 +79,7 @@ class StartupRecovery {
       final readable = await StateStore.open(
         failure.directory,
         storage: storage,
+        localKey: _localKey,
       );
       readable.dispose();
     } on StateRecoveryRequired {
@@ -123,7 +128,7 @@ class StartupRecovery {
       ).map((byte) => byte.toRadixString(16).padLeft(2, '0')).join(),
     };
     final key = CryptoBox.random(32);
-    final localKey = LocalStateKey(directory, storage);
+    final localKey = _localKey;
     final envelope = password == null
         ? null
         : await localKey.prepareRecovery(key, password);
@@ -162,7 +167,11 @@ class StartupRecovery {
       if (envelope != null) await localKey.installRecovery(envelope);
       await localKey.saveFresh(key);
       await pending.rename(p.join(directory.path, 'state-v1.enc'));
-      final reopened = await StateStore.open(directory, storage: storage);
+      final reopened = await StateStore.open(
+        directory,
+        storage: storage,
+        localKey: localKey,
+      );
       try {
         require(jsonEncode(reopened.data) == jsonEncode(data), '恢复数据保存校验失败');
       } finally {

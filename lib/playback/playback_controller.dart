@@ -10,7 +10,10 @@ import '../data/http.dart';
 import '../data/playback_store.dart';
 import '../domain/models.dart';
 import '../domain/playback.dart';
+import '../domain/playback_folder.dart';
 import 'media_backend.dart';
+import 'playlist_order.dart';
+import 'playback_sleep_timer.dart';
 import 'playback_failure.dart';
 import 'playback_selection.dart';
 import 'subtitle_matching.dart';
@@ -84,6 +87,7 @@ class PlaybackController extends ChangeNotifier {
     this.checkAhead,
     this.sourceAccepted,
     this.externalStreamFactory = ExternalPlaybackStream.new,
+    DateTime Function()? now,
   }) : entries = List.unmodifiable(entries),
        preferences = history.preferences,
        index = initialIndex {
@@ -92,6 +96,13 @@ class PlaybackController extends ChangeNotifier {
       '播放列表为空',
     );
     sourceProgress.addListener(_changed);
+    _playlistFolder = playbackFolder(current);
+    playlistOrder = history.orderFor(_playlistFolder);
+    _orderPlaylist();
+    preferences = history.preferencesFor(folderKey);
+    _persistedPreferences = preferences;
+    sleepTimer = PlaybackSleepTimer(onExpired: _stopForSleep, now: now)
+      ..addListener(_onSleepChanged);
   }
   final List<PlaybackEntry> entries;
   final int initialIndex;
@@ -130,6 +141,15 @@ class PlaybackController extends ChangeNotifier {
   /// The page can finish its native orientation/layout transition before play.
   Future<void> Function()? beforePlay;
   PlaybackPreferences preferences;
+  late PlaybackPreferences _persistedPreferences;
+  late final String? _playlistFolder;
+  late PlaybackPlaylistOrder playlistOrder;
+  late List<int> playlistIndices, _playlistPositions;
+  late final PlaybackSleepTimer sleepTimer;
+  PlaybackSleepMode _sleepMode = PlaybackSleepMode.off;
+  int _sleepRevision = 0;
+  String? get folderKey => playbackFolder(current);
+  bool get remembersFolder => history.remembersFolder(folderKey);
   int index, _generation = 0;
   bool loading = false, closed = false, boosting = false, _background = false;
   bool _sourceRecoveryUsed = false;
@@ -155,8 +175,13 @@ class PlaybackController extends ChangeNotifier {
   PlaybackEntry get current => entries[index];
   PlaybackBackend? get backend => _session?.backend;
   PlayerState get state => backend?.state ?? const PlayerState();
-  bool get canPrevious => index > 0;
-  bool get canNext => index + 1 < entries.length;
+  int get playlistPosition => _playlistPositions[index];
+  int playlistPositionOf(int entryIndex) => _playlistPositions[entryIndex];
+  int? get previousIndex =>
+      canPrevious ? playlistIndices[playlistPosition - 1] : null;
+  int? get nextIndex => canNext ? playlistIndices[playlistPosition + 1] : null;
+  bool get canPrevious => playlistPosition > 0;
+  bool get canNext => playlistPosition + 1 < entries.length;
   bool get ready => !loading && error.isEmpty && backend != null;
   bool get hasVideo => current.video;
   int get connections => preferences.connectionsFor(current.platform);
@@ -170,8 +195,107 @@ class PlaybackController extends ChangeNotifier {
   double get effectiveRate =>
       boosting ? math.max(2.0, preferences.rate) : preferences.rate;
   int get generation => _generation;
+  bool canResumeAfterPanel(int generation, int stopRevision) =>
+      ready &&
+      !closed &&
+      !_background &&
+      generation == _generation &&
+      !sleepTimer.stopped &&
+      sleepTimer.stopRevision == stopRevision;
+
+  Future<Uint8List> screenshot({bool includeSubtitles = false}) async {
+    final session = _session;
+    require(
+      ready && hasVideo && session?.backend.supportsScreenshot == true,
+      '请等待视频画面加载完成后截图',
+    );
+    final bytes = await session!.backend.screenshot(
+      includeSubtitles: includeSubtitles,
+    );
+    require(_current(session), '视频已切换，请重新截图');
+    require(
+      bytes != null && bytes.isNotEmpty && bytes.length <= 32 * 1024 * 1024,
+      '无法获取当前画面，视频分辨率过大或画面尚未就绪',
+    );
+    return bytes!;
+  }
+
   void _changed() {
     if (!closed) notifyListeners();
+  }
+
+  void _orderPlaylist() {
+    playlistIndices = orderedPlaybackIndices(entries, playlistOrder);
+    _playlistPositions = List.filled(entries.length, 0);
+    for (var i = 0; i < playlistIndices.length; i++) {
+      _playlistPositions[playlistIndices[i]] = i;
+    }
+  }
+
+  Future<void> setPlaylistOrder(PlaybackPlaylistOrder order) async {
+    if (closed || loading || playlistOrder == order) return;
+    playlistOrder = order;
+    _orderPlaylist();
+    _discardPrepared();
+    _session?.aheadAttempted = false;
+    _changed();
+    await _preferenceGate.run(() => history.saveOrder(_playlistFolder, order));
+  }
+
+  Future<void> setRememberFolder(bool enabled) async {
+    final key = folderKey, generation = _generation;
+    if (key == null || loading || closed) return;
+    await _preferenceGate.run(() => history.rememberFolder(key, enabled));
+    if (closed || generation != _generation) return;
+    final wasSubtitles = preferences.subtitles;
+    preferences = history.preferencesFor(key);
+    _persistedPreferences = preferences;
+    _changed();
+    await _command((backend) async {
+      await backend.setRate(effectiveRate);
+      if (generation != _generation) return;
+      if (wasSubtitles != preferences.subtitles) {
+        await backend.setSubtitleTrack(
+          preferences.subtitles
+              ? (_selection?.subtitle?.id == 'no'
+                    ? SubtitleTrack.auto()
+                    : _selection?.subtitle ?? SubtitleTrack.auto())
+              : SubtitleTrack.no(),
+        );
+      }
+    });
+  }
+
+  void _onSleepChanged() {
+    if (closed ||
+        (_sleepMode == sleepTimer.mode &&
+            _sleepRevision == sleepTimer.stopRevision)) {
+      return;
+    }
+    _sleepMode = sleepTimer.mode;
+    _sleepRevision = sleepTimer.stopRevision;
+    _discardPrepared();
+    _session?.aheadAttempted = false;
+    _changed();
+    if (sleepTimer.mode == PlaybackSleepMode.episode &&
+        ready &&
+        state.completed) {
+      unawaited(sleepTimer.finishEpisode());
+    }
+  }
+
+  Future<void> _stopForSleep() async {
+    if (closed) return;
+    notice = '定时停止已生效，播放进度已保留';
+    await pause();
+    // A timer can expire while the native play command is still completing.
+    // The opening path also checks _playWhenReady after that command returns.
+    if (!closed && sleepTimer.stopped && state.playing) {
+      try {
+        await backend?.pause();
+      } catch (_) {}
+    }
+    _changed();
   }
 
   Map<String, Object?> _logFields(
@@ -213,8 +337,12 @@ class PlaybackController extends ChangeNotifier {
     bool? playWhenReady,
     bool refreshSource = false,
     bool automaticRecovery = false,
+    bool automaticAdvance = false,
   }) {
     if (closed || next < 0 || next >= entries.length) return Future.value();
+    if (!automaticRecovery && !automaticAdvance && playWhenReady != false) {
+      sleepTimer.acknowledgePlay();
+    }
     final future = _load(
       next,
       fromStart: fromStart,
@@ -268,7 +396,7 @@ class PlaybackController extends ChangeNotifier {
     final selection = _selection!;
     sourceProgress.clear();
     if (!automaticRecovery) _sourceRecoveryUsed = false;
-    _playWhenReady = playWhenReady ?? true;
+    _playWhenReady = (playWhenReady ?? true) && !sleepTimer.stopped;
     _scope?.cancel();
     _subtitleScope?.cancel();
     subtitleLoading = false;
@@ -286,7 +414,11 @@ class PlaybackController extends ChangeNotifier {
     await _stopExternalPlayback();
     await _retire(old);
     await retiredSelection?.release();
+    await _preferenceGate.run(() async {});
     if (closed || generation != _generation) return;
+    preferences = history.preferencesFor(folderKey);
+    _persistedPreferences = preferences;
+    _changed();
     DownloadSpec? unowned;
     PlaybackBackend? warming;
     Future<void>? warmingReady;
@@ -384,8 +516,11 @@ class PlaybackController extends ChangeNotifier {
           await beforePlay?.call();
           if (!_current(session)) return;
           stage = 'play';
-          session.playRequested = _playWhenReady;
+          sleepTimer.checkDeadline();
+          session.playRequested = _playWhenReady && !sleepTimer.stopped;
           if (!_background && session.playRequested) await backend.play();
+          if (!_current(session)) return;
+          if (!_playWhenReady || sleepTimer.stopped) await backend.pause();
           if (!_current(session)) return;
           _checkInitialization(session);
           session.initializing = false;
@@ -543,6 +678,8 @@ class PlaybackController extends ChangeNotifier {
         !ready ||
         !_current(session) ||
         !preferences.autoNext ||
+        sleepTimer.mode == PlaybackSleepMode.episode ||
+        sleepTimer.stopped ||
         !canNext ||
         !_playWhenReady ||
         !session.playRequested ||
@@ -561,7 +698,7 @@ class PlaybackController extends ChangeNotifier {
     }
     session.aheadAttempted = true;
     _discardPrepared();
-    final prepared = _prepared = _PreparedSource(entries[index + 1]);
+    final prepared = _prepared = _PreparedSource(entries[nextIndex!]);
     _trackAhead(_prepareNext(prepared));
   }
 
@@ -890,7 +1027,9 @@ class PlaybackController extends ChangeNotifier {
   bool _atEnd(_Session session) {
     final state = session.backend.state;
     return state.completed ||
-        (preferences.autoNext &&
+        (sleepTimer.mode != PlaybackSleepMode.episode &&
+            !sleepTimer.stopped &&
+            preferences.autoNext &&
             canNext &&
             preferences.skipOutroSeconds > 0 &&
             state.playing &&
@@ -917,14 +1056,21 @@ class PlaybackController extends ChangeNotifier {
   }
 
   Future<void> _completed(_Session session) async {
+    if (sleepTimer.mode == PlaybackSleepMode.episode) {
+      await sleepTimer.finishEpisode();
+    }
     await _save(session, completed: true);
+    sleepTimer.checkDeadline();
     if (_current(session) &&
         session.completionHandled &&
         _atEnd(session) &&
         preferences.autoNext &&
+        !sleepTimer.stopped &&
+        sleepTimer.mode != PlaybackSleepMode.episode &&
+        _playWhenReady &&
         canNext &&
         !_background) {
-      await load(index + 1);
+      await load(nextIndex!, automaticAdvance: true);
     }
   }
 
@@ -1024,6 +1170,9 @@ class PlaybackController extends ChangeNotifier {
   }
 
   Future<void> play() async {
+    if (closed) return;
+    sleepTimer.acknowledgePlay();
+    final sleepRevision = sleepTimer.stopRevision;
     _externalRevision++;
     _externalScope?.cancel();
     if (_externalStream != null) await _stopExternalPlayback();
@@ -1036,7 +1185,11 @@ class PlaybackController extends ChangeNotifier {
         _session?.completionHandled = false;
         await backend.seek(Duration.zero);
       }
+      if (sleepRevision != sleepTimer.stopRevision || sleepTimer.stopped) {
+        return;
+      }
       await backend.play();
+      if (sleepTimer.stopped) await backend.pause();
     }, operation: 'play');
   }
 
@@ -1095,16 +1248,23 @@ class PlaybackController extends ChangeNotifier {
     playWhenReady: true,
     refreshSource: true,
   );
-  Future<void> previous() => canPrevious ? load(index - 1) : Future.value();
-  Future<void> next() => canNext ? load(index + 1) : Future.value();
+  Future<void> previous() =>
+      canPrevious ? load(previousIndex!) : Future.value();
+  Future<void> next() => canNext ? load(nextIndex!) : Future.value();
   Future<void> updatePreferences(
     PlaybackPreferences value, {
     bool save = true,
   }) async {
+    final previous = _persistedPreferences, folder = folderKey;
     preferences = value;
     if (!preferences.autoNext) _discardPrepared();
     _changed();
-    if (save) await _preferenceGate.run(() => history.savePreferences(value));
+    if (save) {
+      _persistedPreferences = value;
+      await _preferenceGate.run(
+        () => history.saveEffectivePreferences(folder, value, previous),
+      );
+    }
   }
 
   Future<void> setRate(double value) async {
@@ -1312,6 +1472,7 @@ class PlaybackController extends ChangeNotifier {
 
   void foreground() {
     _background = false;
+    sleepTimer.checkDeadline();
   }
 
   Future<bool> openExternalPlayer(
@@ -1376,6 +1537,7 @@ class PlaybackController extends ChangeNotifier {
       if (!launched &&
           wasPlaying &&
           currentRequest() &&
+          !sleepTimer.stopped &&
           !_background &&
           ready) {
         await play();
@@ -1397,6 +1559,8 @@ class PlaybackController extends ChangeNotifier {
   Future<void> close() => _closeFuture ??= _close();
   Future<void> _close() async {
     closed = true;
+    sleepTimer.removeListener(_onSleepChanged);
+    sleepTimer.dispose();
     sourceProgress.close();
     sourceProgress.removeListener(_changed);
     ++_generation;
@@ -1417,6 +1581,7 @@ class PlaybackController extends ChangeNotifier {
     await Future.wait(_inflightLoads.toList());
     await Future.wait(_subtitleLoads.toList());
     await Future.wait(_aheadTasks.toList());
+    await sleepTimer.settle();
     await _preferenceGate.run(() async {});
     await history.store.flush();
     super.dispose();

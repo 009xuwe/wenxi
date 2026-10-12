@@ -20,10 +20,16 @@ void main() {
         expect(legacy.browserDisplayFor(platform).view, 'grid');
         expect(legacy.browserDisplayFor(platform).sort, 'name');
         expect(legacy.browserDisplayFor(platform).ascending, isTrue);
+        expect(legacy.browserDisplayFor(platform).searchSubfolders, isFalse);
       }
       final invalid = AppSettings.fromJson({
         'browserDisplays': {
-          'quark': {'view': 'bad', 'sort': 'bad', 'ascending': 'bad'},
+          'quark': {
+            'view': 'bad',
+            'sort': 'bad',
+            'ascending': 'bad',
+            'searchSubfolders': 'bad',
+          },
           'baidu': null,
           'unknown': {'view': 'grid'},
         },
@@ -32,6 +38,7 @@ void main() {
         'view': 'list',
         'sort': 'name',
         'ascending': true,
+        'searchSubfolders': false,
       });
       expect(invalid.browserDisplays.keys, ['quark']);
     },
@@ -61,11 +68,20 @@ void main() {
         await Future.wait([
           services.updateBrowserDisplay(CloudPlatform.quark, view: 'grid'),
           services.updateBrowserDisplay(CloudPlatform.quark, sort: 'date'),
+          services.updateBrowserDisplay(
+            CloudPlatform.quark,
+            searchSubfolders: true,
+          ),
           services.updateSettings({'theme': 'Dark'}),
           services.updateBrowserDisplay(CloudPlatform.uc, sort: 'size'),
         ]);
         await services.updateBrowserDisplay(CloudPlatform.quark, sort: 'date');
-        final expected = {'view': 'grid', 'sort': 'date', 'ascending': false};
+        final expected = {
+          'view': 'grid',
+          'sort': 'date',
+          'ascending': false,
+          'searchSubfolders': true,
+        };
         expect(
           services.settings.browserDisplayFor(CloudPlatform.quark).toJson(),
           expected,
@@ -74,10 +90,16 @@ void main() {
           'view': 'list',
           'sort': 'size',
           'ascending': true,
+          'searchSubfolders': false,
         });
         expect(
           services.settings.browserDisplayFor(CloudPlatform.baidu).toJson(),
-          {'view': 'list', 'sort': 'name', 'ascending': true},
+          {
+            'view': 'list',
+            'sort': 'name',
+            'ascending': true,
+            'searchSubfolders': false,
+          },
         );
         expect(services.settings.theme, 'Dark');
         await services.close();

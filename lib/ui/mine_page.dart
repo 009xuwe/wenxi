@@ -9,9 +9,11 @@ import '../diagnostics/diagnostic_bundle.dart';
 import '../domain/settings.dart';
 import '../platform/native_engine.dart';
 import 'common.dart';
+import 'appearance_page.dart';
 import 'remote_control_dialogs.dart';
 import 'diagnostics_page.dart';
 import 'download_protection_page.dart';
+import 'download_destination_dialog.dart';
 import 'experimental_features_page.dart';
 import 'contact_author_dialog.dart';
 
@@ -46,10 +48,11 @@ class MinePage extends StatelessWidget {
   Future<void> _threads(BuildContext context, String key) async {
     final profile = AppSettings.profiles[key]!;
     final current = services.settings.threadOverrides[key];
+    final maximum = key == 'aliyun' ? 8 : 512;
     final choice = await showDialog<int>(
       context: context,
       builder: (context) => SimpleDialog(
-        title: Text('${profile.$1}连接数'),
+        title: Text('${profile.$1}${key == 'aliyun' ? '连接上限' : '连接数'}'),
         children: [
           SimpleDialogOption(
             onPressed: () => Navigator.pop(context, -1),
@@ -58,13 +61,23 @@ class MinePage extends StatelessWidget {
           SimpleDialogOption(
             onPressed: () => Navigator.pop(context, 0),
             child: Text(
-              '跟随全局（${services.settings.threads}）${current == 0 ? ' ✓' : ''}',
+              '跟随全局（${services.settings.threads.clamp(1, maximum)}）${current == 0 ? ' ✓' : ''}',
             ),
           ),
           SimpleDialogOption(
             onPressed: () => Navigator.pop(context, 1),
             child: const Text('自定义连接数…'),
           ),
+          if (key == 'aliyun')
+            const Padding(
+              padding: EdgeInsets.fromLTRB(24, 8, 24, 12),
+              child: Text('根据连接情况自动调整，最高不超过所设上限。'),
+            ),
+          if (key == 'baidu_public')
+            const Padding(
+              padding: EdgeInsets.fromLTRB(24, 8, 24, 12),
+              child: Text('此设置用于公益解析。使用自己的百度账号下载时固定为 1 个连接。'),
+            ),
         ],
       ),
     );
@@ -74,14 +87,15 @@ class MinePage extends StatelessWidget {
       final text = await askText(
         context,
         '自定义连接数',
-        initial: '${current ?? profile.$2}',
-        hint: '1–512',
+        initial:
+            '${key == 'aliyun' ? (current ?? profile.$2).clamp(1, maximum) : current ?? profile.$2}',
+        hint: '1–$maximum',
         numeric: true,
       );
       if (text == null || !context.mounted) return;
       value = int.tryParse(text);
-      if (value == null || value < 1 || value > 512) {
-        message(context, '连接数范围为 1–512');
+      if (value == null || value < 1 || value > maximum) {
+        message(context, '连接数范围为 1–$maximum');
         return;
       }
     } else if (choice == 0) {
@@ -126,6 +140,45 @@ class MinePage extends StatelessWidget {
   }
 
   Future<void> _export(BuildContext context) async {
+    var includeImages = false;
+    if (services.settings.background.hasImage) {
+      final choice = await showDialog<bool>(
+        context: context,
+        builder: (context) => StatefulBuilder(
+          builder: (context, update) => AlertDialog(
+            title: const Text('导出加密备份'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                CheckboxListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('同时备份背景图片'),
+                  value: includeImages,
+                  onChanged: (value) =>
+                      update(() => includeImages = value ?? false),
+                ),
+                const Text(
+                  '不携带图片时，恢复后使用纯色背景；主题配色和其他设置仍会保留。',
+                  style: TextStyle(fontSize: 13, height: 1.5),
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('取消'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, includeImages),
+                child: const Text('继续'),
+              ),
+            ],
+          ),
+        ),
+      );
+      if (choice == null || !context.mounted) return;
+      includeImages = choice;
+    }
     final password = await askText(
       context,
       '设置备份密码',
@@ -135,7 +188,10 @@ class MinePage extends StatelessWidget {
     if (password == null || !context.mounted) return;
     final bytes = await busy(
       context,
-      () => services.backup.create(password),
+      () => services.backup.create(
+        password,
+        includeBackgroundImages: includeImages,
+      ),
       label: '正在加密备份…',
     );
     if (bytes != null && context.mounted) {
@@ -192,10 +248,10 @@ class MinePage extends StatelessWidget {
     width: 34,
     height: 34,
     decoration: BoxDecoration(
-      color: brandBlue.withValues(alpha: .09),
+      color: themeAccent(context).withValues(alpha: .09),
       borderRadius: BorderRadius.circular(10),
     ),
-    child: Icon(icon, size: 19, color: brandBlue),
+    child: Icon(icon, size: 19, color: themeAccent(context)),
   );
 
   Widget _tile(
@@ -251,13 +307,18 @@ class MinePage extends StatelessWidget {
     children: [
       Padding(
         padding: const EdgeInsets.only(left: 4, bottom: 10),
-        child: Text(
-          title,
-          style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
+        child: Align(
+          alignment: Alignment.centerLeft,
+          child: BackgroundReadable(
+            child: Text(
+              title,
+              style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
+            ),
+          ),
         ),
       ),
       Material(
-        color: Theme.of(context).colorScheme.surface,
+        color: backgroundSurface(context),
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(16),
           side: BorderSide(color: border(context), width: .7),
@@ -294,117 +355,25 @@ class MinePage extends StatelessWidget {
     ],
   );
 
-  static const _themes = [
-    ('System', '跟随系统', CupertinoIcons.device_desktop),
-    ('Light', '浅色', CupertinoIcons.sun_max),
-    ('Dark', '深色', CupertinoIcons.moon),
-  ];
-
-  Future<void> _chooseTheme(BuildContext context) async {
-    final selected = await showModalBottomSheet<String>(
-      context: context,
-      showDragHandle: true,
-      builder: (context) => SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(8, 0, 8, 16),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Padding(
-                padding: EdgeInsets.only(bottom: 10),
-                child: Text(
-                  '外观模式',
-                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
-                ),
-              ),
-              for (final choice in _themes)
-                ListTile(
-                  leading: _settingIcon(context, choice.$3),
-                  title: Text(choice.$2),
-                  trailing: services.settings.theme == choice.$1
-                      ? const Icon(
-                          CupertinoIcons.check_mark,
-                          color: brandBlue,
-                          size: 20,
-                        )
-                      : null,
-                  onTap: () => Navigator.pop(context, choice.$1),
-                ),
-            ],
-          ),
-        ),
-      ),
-    );
-    if (selected != null) await services.updateSettings({'theme': selected});
-  }
-
   Widget _appearance(
     BuildContext context,
     AppSettings settings,
     bool desktop,
   ) => _section(context, '外观', [
-    if (desktop)
-      Padding(
-        padding: const EdgeInsets.all(16),
-        child: Align(
-          alignment: Alignment.centerLeft,
-          child: Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: [
-              for (final choice in _themes)
-                ChoiceChip(
-                  key: ValueKey('settings-theme-${choice.$1}'),
-                  label: Text(choice.$2),
-                  avatar: Icon(
-                    choice.$3,
-                    size: 16,
-                    color: settings.theme == choice.$1
-                        ? brandBlue
-                        : secondary(context),
-                  ),
-                  selected: settings.theme == choice.$1,
-                  showCheckmark: false,
-                  selectedColor: brandBlue.withValues(alpha: .1),
-                  backgroundColor: Theme.of(context).colorScheme.surface,
-                  labelStyle: TextStyle(
-                    fontSize: 12,
-                    color: settings.theme == choice.$1
-                        ? brandBlue
-                        : Theme.of(context).colorScheme.onSurface,
-                  ),
-                  side: BorderSide(
-                    color: settings.theme == choice.$1
-                        ? brandBlue.withValues(alpha: .3)
-                        : border(context),
-                  ),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(10),
-                  ),
-                  onSelected: (selected) async {
-                    if (selected) {
-                      await services.updateSettings({'theme': choice.$1});
-                    }
-                  },
-                ),
-            ],
-          ),
-        ),
-      )
-    else
-      _tile(
+    _tile(
+      context,
+      CupertinoIcons.paintbrush,
+      '主题与外观',
+      '${settings.themePalette.label} · ${settings.glassStyle.label}',
+      () => Navigator.of(
         context,
-        CupertinoIcons.paintbrush,
-        '外观模式',
-        '',
-        () => _chooseTheme(context),
-        value: _themes
-            .firstWhere(
-              (item) => item.$1 == settings.theme,
-              orElse: () => _themes.first,
-            )
-            .$2,
-      ),
+      ).push(MaterialPageRoute<void>(builder: (_) => AppearancePage(services))),
+      value: switch (settings.theme) {
+        'Light' => '浅色',
+        'Dark' => '深色',
+        _ => '跟随系统',
+      },
+    ),
   ]);
 
   Widget _platformThreads(BuildContext context, AppSettings settings) =>
@@ -414,7 +383,7 @@ class MinePage extends StatelessWidget {
         childrenPadding: const EdgeInsets.only(bottom: 8),
         shape: const Border(),
         collapsedShape: const Border(),
-        iconColor: brandBlue,
+        iconColor: themeAccent(context),
         collapsedIconColor: secondary(context),
         leading: _settingIcon(context, CupertinoIcons.slider_horizontal_3),
         title: const Text(
@@ -433,12 +402,14 @@ class MinePage extends StatelessWidget {
               contentPadding: const EdgeInsets.only(left: 62, right: 18),
               title: Text(entry.value.$1, style: const TextStyle(fontSize: 13)),
               trailing: Text(
-                settings.threadOverrides[entry.key] == null
+                entry.key == 'aliyun'
+                    ? '最多 ${settings.connectionsFor(null, 'aliyun')}'
+                    : settings.threadOverrides[entry.key] == null
                     ? '预设 ${entry.value.$2}'
                     : settings.threadOverrides[entry.key] == 0
                     ? '跟随全局'
                     : '${settings.threadOverrides[entry.key]}',
-                style: const TextStyle(fontSize: 12, color: brandBlue),
+                style: TextStyle(fontSize: 12, color: themeAccent(context)),
               ),
               onTap: () => _threads(context, entry.key),
             ),
@@ -476,90 +447,129 @@ class MinePage extends StatelessWidget {
     ),
   ]);
 
-  Widget _downloads(BuildContext context, AppSettings settings) =>
-      _section(context, '下载设置', [
-        _tile(
-          context,
-          CupertinoIcons.arrow_down_circle,
-          'HTTP 下载连接数',
-          '单个下载的连接上限',
-          () => _number(context, '全局连接数', 'threads', settings.threads, 1, 512),
-          value: '${settings.threads}',
-        ),
-        _platformThreads(context, settings),
-        _tile(
-          context,
-          CupertinoIcons.arrow_2_circlepath,
-          '失败重试次数',
-          '',
-          () => _number(context, '失败重试次数', 'retries', settings.retries, 0, 3),
-          value: '${settings.retries} 次',
-        ),
-        _tile(
-          context,
-          CupertinoIcons.speedometer,
-          '单任务限速',
-          '',
-          () async {
-            final text = await askText(
-              context,
-              '限速（KB/s）',
-              initial: '${settings.speedLimit ~/ 1024}',
-              hint: '0 表示不限速',
-              numeric: true,
-            );
-            if (text == null || !context.mounted) return;
-            final value = int.tryParse(text);
-            if (value == null || value < 0 || value > 10000000) {
-              message(context, '请输入有效的速度');
-              return;
-            }
-            await services.updateSettings({'speedLimit': value * 1024});
-          },
-          value: settings.speedLimit == 0
-              ? '不限速'
-              : '${formatBytes(settings.speedLimit)}/s',
-        ),
-        _tile(
-          context,
-          CupertinoIcons.folder,
-          '下载保存目录',
-          settings.destination ?? '系统下载目录',
-          () async {
-            final directory = await busy(
-              context,
-              services.files.chooseDirectory,
-              label: '选择下载目录…',
-            );
-            if (directory != null) {
-              await services.updateSettings({'destination': directory});
-            }
-          },
-        ),
-        if (settings.destination != null)
-          Padding(
-            padding: const EdgeInsets.only(left: 54, bottom: 8),
-            child: Align(
-              alignment: Alignment.centerLeft,
-              child: TextButton(
-                onPressed: () => services.updateSettings({'destination': null}),
-                child: const Text('恢复默认目录'),
-              ),
-            ),
-          ),
-        if (services.platformFeatures &&
-            (Platform.isAndroid || Platform.isWindows))
-          _tile(
+  Widget _downloads(BuildContext context, AppSettings settings) => _section(
+    context,
+    '下载设置',
+    [
+      _tile(
+        context,
+        CupertinoIcons.arrow_down_circle,
+        'HTTP 下载连接数',
+        '单个下载的连接上限',
+        () => _number(context, '全局连接数', 'threads', settings.threads, 1, 512),
+        value: '${settings.threads}',
+      ),
+      _platformThreads(context, settings),
+      _tile(
+        context,
+        CupertinoIcons.arrow_2_circlepath,
+        '失败重试次数',
+        '',
+        () => _number(context, '失败重试次数', 'retries', settings.retries, 0, 3),
+        value: '${settings.retries} 次',
+      ),
+      _tile(
+        context,
+        CupertinoIcons.speedometer,
+        '单任务限速',
+        '',
+        () async {
+          final text = await askText(
             context,
-            CupertinoIcons.shield_lefthalf_fill,
-            '后台下载保护',
-            Platform.isWindows ? '托盘下载与自动休眠保护' : '锁屏下载、通知与系统后台设置',
-            () => Navigator.push<void>(
-              context,
-              MaterialPageRoute(builder: (_) => const DownloadProtectionPage()),
+            '限速（KB/s）',
+            initial: '${settings.speedLimit ~/ 1024}',
+            hint: '0 表示不限速',
+            numeric: true,
+          );
+          if (text == null || !context.mounted) return;
+          final value = int.tryParse(text);
+          if (value == null || value < 0 || value > 10000000) {
+            message(context, '请输入有效的速度');
+            return;
+          }
+          await services.updateSettings({'speedLimit': value * 1024});
+        },
+        value: settings.speedLimit == 0
+            ? '不限速'
+            : '${formatBytes(settings.speedLimit)}/s',
+      ),
+      _tile(
+        context,
+        CupertinoIcons.folder,
+        '下载保存目录',
+        settings.destination ?? '系统下载目录',
+        () async {
+          final directory = await busy(
+            context,
+            services.files.chooseDirectory,
+            label: '选择下载目录…',
+          );
+          if (directory != null && context.mounted) {
+            await _changeDownloadDirectory(context, directory);
+          }
+        },
+      ),
+      if (settings.destination != null)
+        Padding(
+          padding: const EdgeInsets.only(left: 54, bottom: 8),
+          child: Align(
+            alignment: Alignment.centerLeft,
+            child: TextButton(
+              onPressed: () => _changeDownloadDirectory(context, null),
+              child: const Text('恢复默认目录'),
             ),
           ),
-      ], footer: '设置用于新添加的任务。实际连接数由文件大小与服务器决定；BT 最多连接 80 个对等节点。');
+        ),
+      if (services.platformFeatures &&
+          (Platform.isAndroid || Platform.isWindows))
+        _tile(
+          context,
+          CupertinoIcons.shield_lefthalf_fill,
+          '后台下载保护',
+          Platform.isWindows ? '托盘下载与自动休眠保护' : '锁屏下载、通知与系统后台设置',
+          () => Navigator.push<void>(
+            context,
+            MaterialPageRoute(builder: (_) => const DownloadProtectionPage()),
+          ),
+        ),
+    ],
+    footer:
+        '连接数、重试和限速设置用于新任务。更改保存目录时可同步未完成任务。实际连接数由文件大小与服务器决定；BT 最多连接 80 个对等节点。',
+  );
+
+  Future<void> _changeDownloadDirectory(
+    BuildContext context,
+    String? directory,
+  ) async {
+    final unfinished = services.downloads.tasks
+        .where((task) => !task.terminal)
+        .length;
+    if (directory == services.settings.destination && unfinished == 0) return;
+    var choice = DownloadDestinationChoice.newTasks;
+    if (unfinished > 0) {
+      final selected = await chooseDownloadDestinationScope(
+        context,
+        destination: directory,
+        unfinished: unfinished,
+      );
+      if (selected == null || !context.mounted) return;
+      choice = selected;
+    }
+    final updated = await busy(
+      context,
+      () => services.updateDownloadDestination(
+        directory,
+        includeUnfinished: choice == DownloadDestinationChoice.unfinished,
+      ),
+      label: '更新下载目录…',
+    );
+    if (updated != null && context.mounted) {
+      message(
+        context,
+        updated > 0 ? '目录已更新，已同步 $updated 个任务，请到传输管理继续' : '目录已更新，新任务将保存到此处',
+      );
+    }
+  }
 
   Widget _data(BuildContext context) => _section(context, '备份与数据', [
     _tile(
@@ -710,7 +720,11 @@ class MinePage extends StatelessWidget {
             28 + MediaQuery.paddingOf(context).bottom,
           ),
           children: [
-            _identity(context, desktop),
+            BackgroundReadable(
+              padding: const EdgeInsets.all(12),
+              radius: 16,
+              child: _identity(context, desktop),
+            ),
             SizedBox(height: desktop ? 26 : 24),
             if (columns)
               Row(

@@ -236,6 +236,132 @@ document.title=title_name + ' - 蓝奏云';</script>''');
   );
 
   test(
+    'Folder file query parameters survive resolution without becoming the file identity',
+    () async {
+      final fixture = LanzouFolderFixture();
+      const reference = 'iExample123?webpage=preview_a%2Bb_c&key=one&key=two';
+      fixture.pages['321']![1]!['text'] = [
+        {'id': reference, 'name_all': 'Example & 1.zip', 'size': '1.5 M'},
+      ];
+      final session = await fixture.openFolder('Ab12');
+      final file = (await fixture.connector.list(
+        session,
+        session.rootId,
+        null,
+      )).single;
+      expect(file.id, 'iExample123');
+      expect(file.token, 'https://author.lanzouu.com/$reference');
+      final spec = await fixture.connector.download(session, file, null);
+      expect(spec.url, lanzouTestFinal);
+      expect(spec.expectedSize, fixture.exactSize);
+      expect(
+        fixture.http.calls
+            .where((r) => r.uri.path == '/iExample123')
+            .single
+            .url,
+        'https://author.lanzouu.com/$reference',
+      );
+    },
+  );
+
+  test(
+    'A saved folder download uses renewed webpage parameters after restart',
+    () async {
+      final fixture = LanzouFolderFixture();
+      fixture.pages['321']![1]!['text'] = [
+        {
+          'id': 'iExample123?webpage=before',
+          'name_all': 'Example & 1.zip',
+          'size': '1.5 M',
+        },
+      ];
+      final repo = repository(fixture);
+      final session = await repo.share(fixture.folderLink());
+      final file = (await repo.list(session, session.rootId)).single;
+      final saved = DownloadSpec.fromJson(
+        asJson(
+          jsonDecode(encoded((await repo.prepare(session, file)).toJson())),
+        ),
+      );
+      final restarted = LanzouFolderFixture();
+      restarted.pages['321']![1]!['text'] = [
+        {
+          'id': 'iExample123?webpage=renewed',
+          'name_all': 'Example & 1.zip',
+          'size': '1.5 M',
+        },
+      ];
+      final refreshed = await repository(restarted).refresh(saved);
+      expect(refreshed.url, lanzouTestFinal);
+      expect(
+        restarted.http.calls
+            .where((r) => r.uri.path == '/iExample123')
+            .single
+            .url,
+        '$lanzouTestUrl?webpage=renewed',
+      );
+    },
+  );
+
+  test(
+    'Folder pagination deduplicates a file whose webpage parameter changes',
+    () async {
+      final fixture = LanzouFolderFixture();
+      fixture.pages['321']![1]!['text'] = [
+        {
+          'id': 'iExample123?webpage=first',
+          'name_all': 'Example & 1.zip',
+          'size': '1.5 M',
+        },
+      ];
+      fixture.pages['321']![2] = {
+        'zt': 1,
+        'text': [
+          {
+            'id': 'iExample123?webpage=second',
+            'name_all': 'Example & 1.zip',
+            'size': '1.5 M',
+          },
+          {'id': 'iSecond456', 'name_all': 'second.txt', 'size': '2 KB'},
+        ],
+      };
+      final session = await fixture.openFolder();
+      final files = await fixture.connector.list(session, session.rootId, null);
+      expect(files.map((file) => file.id), ['iExample123', 'iSecond456']);
+      expect(files.first.token, '$lanzouTestUrl?webpage=second');
+    },
+  );
+
+  test(
+    'Folder file references reject invalid paths, fragments and malformed escapes',
+    () async {
+      for (final reference in [
+        'https://evil.test/iExample123?webpage=value',
+        '//evil.test/iExample123?webpage=value',
+        '../iExample123?webpage=value',
+        'iExample123/other?webpage=value',
+        'iExample123#?webpage=value',
+        'iExample123?webpage=bad value',
+        'iExample123?webpage=%GG',
+      ]) {
+        final fixture = LanzouFolderFixture();
+        fixture.pages['321']![1]!['text'] = [
+          {'id': reference, 'name_all': 'Example & 1.zip', 'size': '1.5 M'},
+        ];
+        await expectLater(
+          fixture.openFolder(),
+          fails('文件分享标识无效'),
+          reason: reference,
+        );
+        expect(
+          fixture.http.calls.where((r) => r.uri.path.startsWith('/i')),
+          isEmpty,
+        );
+      }
+    },
+  );
+
+  test(
     'Persisted nested downloads refresh after restart without in-memory folder state',
     () async {
       final fixture = LanzouFolderFixture()..withChild();

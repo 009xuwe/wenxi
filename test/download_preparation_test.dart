@@ -9,6 +9,7 @@ import 'package:asterlink/data/cleanup_outbox.dart';
 import 'package:asterlink/data/http.dart';
 import 'package:asterlink/data/state_store.dart';
 import 'package:asterlink/domain/downloads.dart';
+import 'package:asterlink/domain/baidu_share_route.dart';
 import 'package:asterlink/domain/models.dart';
 import 'package:asterlink/download/download_manager.dart';
 import 'package:asterlink/download/download_request.dart';
@@ -123,6 +124,118 @@ class _Fixture {
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+
+  for (final legacy in [false, true]) {
+    test(
+      'public Baidu resumed tasks retain chosen threads, legacy=$legacy',
+      () async {
+        final planned = _planned('public');
+        final spec = DownloadSpec.fromJson({
+          ...planned.toJson(),
+          'url': 'https://cdn.example.test/public',
+          'profile': legacy ? 'baidu' : 'baidu_public',
+          'source': {
+            ...planned.source!,
+            'platform': 'baidu',
+            'session': {
+              ...planned.source!.obj('session'),
+              'platform': 'baidu',
+              'mode': 'share',
+              'metadata': {
+                BaiduShareRoute.metadataKey: BaiduShareRoute.publicParser.key,
+              },
+            },
+          },
+        });
+        final task = DownloadTask(
+          id: 'old-public',
+          spec: spec,
+          createdAt: 1,
+          status: DownloadStatus.paused,
+          connections: legacy ? 1 : 12,
+        );
+        final f = await _Fixture.create(
+          state: StateStore.memory({
+            'settings': {
+              'downloadThreadOverrides': {'baidu': 1},
+            },
+            'tasks': [task.toJson()],
+          }),
+        );
+        await f.manager.resume(task.id);
+        await until(
+          () => f.manager.task(task.id)!.status == DownloadStatus.completed,
+        );
+        expect(f.manager.task(task.id)!.spec.profile, 'baidu_public');
+        expect(f.native.begins.single['connections'], legacy ? 64 : 12);
+        expect(f.native.begins.single['connectionProfile'], 'baidu_public');
+      },
+    );
+  }
+
+  test(
+    'a planned public task captures its own thread choice before resolution',
+    () async {
+      final f = await _Fixture.create();
+      final planned = _planned('public');
+      final spec = DownloadSpec.fromJson({
+        ...planned.toJson(),
+        'profile': 'baidu_public',
+        'source': {
+          ...planned.source!,
+          'platform': 'baidu',
+          'session': {...planned.source!.obj('session'), 'platform': 'baidu'},
+        },
+      });
+      f.resolve = (previous) async => DownloadSpec.fromJson({
+        ...previous.toJson(),
+        'url': 'https://cdn.example.test/public',
+      });
+      final id = await f.manager.enqueue(spec, connections: 32);
+      await until(() => f.manager.task(id)!.status == DownloadStatus.completed);
+      expect(f.native.begins.single['connections'], 32);
+      expect(f.manager.settings.threads, 8);
+    },
+  );
+
+  test(
+    'external thread choice survives restart and never overrides account limits',
+    () async {
+      final f = await _Fixture.create();
+      const spec = DownloadSpec(
+        url: 'https://cdn.example.test/direct',
+        fileName: 'direct.bin',
+      );
+      final id = await f.manager.enqueue(spec, connections: 19);
+      await until(() => f.manager.task(id)!.status == DownloadStatus.completed);
+      expect(f.native.begins.single['connections'], 19);
+      final task = f.manager.task(id)!.update({'status': 'paused'});
+      final reopened = await _Fixture.create(
+        state: StateStore.memory({
+          'settings': {'threads': 128},
+          'tasks': [task.toJson()],
+        }),
+      );
+      await reopened.manager.resume(id);
+      await until(
+        () => reopened.manager.task(id)!.status == DownloadStatus.completed,
+      );
+      expect(reopened.native.begins.single['connections'], 19);
+      final account = DownloadSpec.fromJson({
+        ...spec.toJson(),
+        'profile': 'baidu_preview',
+      });
+      final accountId = await f.manager.enqueue(account, connections: 64);
+      await until(
+        () => f.manager.task(accountId)!.status == DownloadStatus.completed,
+      );
+      expect(f.native.begins.last['connections'], 1);
+      await expectLater(
+        f.manager.enqueue(spec, connections: 513),
+        throwsA(isA<AppException>()),
+      );
+    },
+  );
 
   for (final profile in ['baidu', 'baidu_preview']) {
     for (final ready in [false, true]) {

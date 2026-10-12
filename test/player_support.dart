@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:media_kit/media_kit.dart';
 import 'package:window_manager/window_manager.dart';
 import 'package:asterlink/core/json.dart';
@@ -51,6 +52,21 @@ class FakePlaybackBackend extends PlaybackBackend {
   int connections = 8, segmentSizeMiB = 3;
   bool hardwareAcceleration = true, failHardwareOpen = false, failOpen = false;
   bool sourceFailure = false;
+  bool screenshotSupported = false, nativeSubtitles = false;
+  Uint8List? screenshotBytes;
+  final captures = <bool>[];
+  Future<void>? screenshotBarrier;
+  @override
+  bool get supportsScreenshot => screenshotSupported;
+  @override
+  bool get rendersSubtitlesNatively => nativeSubtitles;
+  @override
+  Future<Uint8List?> screenshot({bool includeSubtitles = false}) async {
+    captures.add(includeSubtitles);
+    await screenshotBarrier;
+    return screenshotBytes;
+  }
+
   bool failAtPlay = false;
   bool throwOnPlay = false;
   @override
@@ -189,22 +205,27 @@ class PlaybackFixture {
     List<CloudPlatform>? platforms,
     bool renewable = false,
     bool prepareAhead = false,
+    List<PlaybackEntry>? suppliedEntries,
+    int initialIndex = 0,
+    DateTime Function()? now,
     ExternalPlaybackStream Function(DownloadSpec)? externalStreamFactory,
     List<PlaybackSubtitle> Function(PlaybackEntry)? subtitlesFor,
     Future<File> Function(PlaybackEntry, PlaybackSubtitle, RequestScope)?
     readSubtitle,
   }) : store = StateStore.memory(data) {
     history = PlaybackStore(store);
-    entries = List.generate(
-      count,
-      (index) => PlaybackEntry(
-        id: '$index',
-        key: playbackKey(['test', index]),
-        name: 'AsterLink 演示 · 第 ${index + 1} 集.mkv',
-        video: true,
-        platform: platforms?[index],
-      ),
-    );
+    entries =
+        suppliedEntries ??
+        List.generate(
+          count,
+          (index) => PlaybackEntry(
+            id: '$index',
+            key: playbackKey(['test', index]),
+            name: 'AsterLink 演示 · 第 ${index + 1} 集.mkv',
+            video: true,
+            platform: platforms?[index],
+          ),
+        );
     Future<DownloadSpec> prepare(
       PlaybackEntry entry,
       RequestScope scope,
@@ -228,7 +249,8 @@ class PlaybackFixture {
       externalStreamFactory:
           externalStreamFactory ?? ExternalPlaybackStream.new,
       entries: entries,
-      initialIndex: 0,
+      initialIndex: initialIndex,
+      now: now,
       history: history,
       checkSource: () {
         require(accountValid, '账号已变化，请重新打开文件列表');

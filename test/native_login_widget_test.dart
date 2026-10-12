@@ -927,6 +927,7 @@ void main() {
     CloudPlatform.pan123,
     CloudPlatform.lanzou,
     CloudPlatform.feijipan,
+    CloudPlatform.pikpak,
     CloudPlatform.tianyi,
     CloudPlatform.xunlei,
   ]) {

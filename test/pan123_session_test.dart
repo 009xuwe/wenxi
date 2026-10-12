@@ -63,6 +63,8 @@ class _Fixture {
     StateStore? store,
     String? token = 'old-token',
     String authType = 'password',
+    Duration listDelay = Duration.zero,
+    Future<void> Function(Duration)? listWait,
   }) : store = store ?? StateStore.memory() {
     vault = Vault(this.store);
     initial = Credential('123', {
@@ -77,6 +79,8 @@ class _Fixture {
       http,
       vault,
       taskDelay: Duration.zero,
+      listDelay: listDelay,
+      listWait: listWait ?? RequestScope.wait,
       now: () => now,
     );
     login = AccountLoginService(
@@ -91,7 +95,7 @@ class _Fixture {
   late final Pan123Connector connector;
   late final AccountLoginService login;
   late final Credential initial;
-  final now = DateTime.utc(2030, 1, 2);
+  var now = DateTime.utc(2030, 1, 2);
   bool oldAccepted = false;
   FutureOr<HttpResult?> Function(RecordedRequest)? override;
   Future<void> seed() => vault.putCredential(_platform, initial);
@@ -141,6 +145,227 @@ class _Fixture {
 }
 
 void main() {
+  test(
+    'Code 100011 retries the same listing page without losing earlier files',
+    () async {
+      final waits = <Duration>[];
+      late _Fixture f;
+      f = _Fixture(
+        listWait: (delay) async {
+          waits.add(delay);
+          f.now = f.now.add(delay);
+        },
+      )..oldAccepted = true;
+      await f.seed();
+      var secondAttempts = 0;
+      f.override = (r) {
+        if (r.uri.path != _list) return null;
+        final first = r.uri.queryParameters['next'] == '0';
+        if (!first && secondAttempts++ == 0) {
+          return jsonResponse({'code': 100011, 'message': '请勿频繁操作，请稍后再试'});
+        }
+        return _ok({
+          'InfoList': [
+            {
+              'FileId': first ? 1 : 2,
+              'FileName': first ? 'first.txt' : 'second.txt',
+              'Type': 0,
+              'ParentFileId': 8,
+              'Etag': first ? 'first-hash' : 'second-hash',
+            },
+          ],
+          'Next': first ? 'next-page' : '-1',
+        });
+      };
+      final files = await f.connector.list(_personal, '8', f.initial);
+      expect(files.map((file) => file.id), ['1', '2']);
+      expect(files.every((file) => file.parentId == '8'), isTrue);
+      expect(files.last.token, contains('second-hash'));
+      expect(f.http.calls.map((r) => r.uri.queryParameters['next']), [
+        '0',
+        'next-page',
+        'next-page',
+      ]);
+      expect(waits, [const Duration(seconds: 2)]);
+      expect(f.signIns, 0);
+    },
+  );
+
+  test(
+    'Repeated listing throttling stops after two retries and keeps cooldown',
+    () async {
+      final waits = <Duration>[];
+      late _Fixture f;
+      f = _Fixture(
+        listWait: (delay) async {
+          waits.add(delay);
+          f.now = f.now.add(delay);
+        },
+      )..oldAccepted = true;
+      await f.seed();
+      f.override = (_) => jsonResponse({'code': 100011});
+      await expectLater(
+        f.connector.list(_personal, '0', f.initial),
+        throwsA(
+          isA<HttpRequestFailure>().having((e) => e.status, 'status', 429),
+        ),
+      );
+      expect(f.http.calls, hasLength(3));
+      expect(waits, [const Duration(seconds: 2), const Duration(seconds: 5)]);
+      expect(f.signIns, 0);
+      f.override = null;
+      await f.connector.list(_personal, '0', f.initial);
+      expect(waits.last, const Duration(seconds: 10));
+      expect(f.http.calls, hasLength(4));
+    },
+  );
+
+  for (final dateHeader in [false, true]) {
+    test('Listing HTTP 429 honors Retry-After (date: $dateHeader)', () async {
+      final waits = <Duration>[];
+      late _Fixture f;
+      f = _Fixture(
+        listWait: (delay) async {
+          waits.add(delay);
+          f.now = f.now.add(delay);
+        },
+      )..oldAccepted = true;
+      await f.seed();
+      var requests = 0;
+      f.override = (_) => requests++ == 0
+          ? HttpResult(429, 'not-json', {
+              'retry-after': [
+                dateHeader
+                    ? HttpDate.format(f.now.add(const Duration(seconds: 7)))
+                    : '7',
+              ],
+            })
+          : null;
+      expect(await f.connector.list(_personal, '0', f.initial), hasLength(1));
+      expect(waits, [const Duration(seconds: 7)]);
+      expect(f.http.calls, hasLength(2));
+      expect(f.signIns, 0);
+    });
+  }
+
+  test(
+    'Concurrent directory listings pace every page and keep their parents',
+    () async {
+      final starts = <DateTime>[];
+      late _Fixture f;
+      f = _Fixture(
+        listDelay: const Duration(milliseconds: 600),
+        listWait: (delay) async => f.now = f.now.add(delay),
+      )..oldAccepted = true;
+      await f.seed();
+      var active = 0, peak = 0;
+      f.override = (r) async {
+        if (r.uri.path != _list) return null;
+        starts.add(f.now);
+        active++;
+        if (active > peak) peak = active;
+        await Future<void>.delayed(Duration.zero);
+        active--;
+        final parent = r.uri.queryParameters['parentFileId']!;
+        final first = r.uri.queryParameters['next'] == '0';
+        return _ok({
+          'InfoList': [
+            {
+              'FileId': '$parent-${first ? 1 : 2}',
+              'FileName': 'file.txt',
+              'Type': 0,
+              'ParentFileId': parent,
+            },
+          ],
+          'Next': first ? 'next' : '-1',
+        });
+      };
+      final results = await Future.wait([
+        f.connector.list(_personal, 'a', f.initial),
+        f.connector.list(_personal, 'b', f.initial),
+      ]);
+      expect(peak, 1);
+      expect(starts, hasLength(4));
+      for (var i = 1; i < starts.length; i++) {
+        expect(
+          starts[i].difference(starts[i - 1]),
+          const Duration(milliseconds: 600),
+        );
+      }
+      expect(results[0].map((file) => file.id), ['a-1', 'a-2']);
+      expect(results[1].map((file) => file.id), ['b-1', 'b-2']);
+    },
+  );
+
+  test(
+    'Cancelling a listing cooldown returns promptly without another request',
+    () async {
+      final waiting = Completer<void>();
+      final f = _Fixture(
+        listWait: (delay) {
+          waiting.complete();
+          return RequestScope.wait(delay);
+        },
+      )..oldAccepted = true;
+      await f.seed();
+      f.override = (_) => jsonResponse({'code': 100011});
+      final scope = RequestScope();
+      final failed = expectLater(
+        scope.run(() => f.connector.list(_personal, '0', f.initial)),
+        throwsA(
+          isA<AppException>().having((e) => e.message, 'message', '请求已取消'),
+        ),
+      );
+      await waiting.future;
+      scope.cancel();
+      await failed.timeout(const Duration(seconds: 1));
+      expect(f.http.calls, hasLength(1));
+    },
+  );
+
+  test(
+    'Cancelling a queued listing skips its network request and frees the queue',
+    () async {
+      final first = Completer<HttpResult>();
+      final f = _Fixture()..oldAccepted = true;
+      await f.seed();
+      f.override = (r) => r.uri.queryParameters['parentFileId'] == 'first'
+          ? first.future
+          : null;
+      final initial = f.connector.list(_personal, 'first', f.initial);
+      await until(() => f.http.calls.length == 1);
+      final scope = RequestScope();
+      final cancelled = expectLater(
+        scope.run(() => f.connector.list(_personal, 'cancelled', f.initial)),
+        throwsA(isA<AppException>()),
+      );
+      scope.cancel();
+      await cancelled.timeout(const Duration(seconds: 1));
+      first.complete(_ok({'InfoList': [], 'Next': '-1'}));
+      await initial;
+      await f.connector.list(_personal, 'next', f.initial);
+      expect(f.http.calls.map((r) => r.uri.queryParameters['parentFileId']), [
+        'first',
+        'next',
+      ]);
+    },
+  );
+
+  test(
+    'Provider rate limiting never retries a mutation or reauthenticates',
+    () async {
+      final f = _Fixture()..oldAccepted = true;
+      await f.seed();
+      f.override = (_) => jsonResponse({'code': 100011});
+      await expectLater(
+        f.connector.delete(_personal, [_file], f.initial),
+        throwsA(isA<HttpRequestFailure>()),
+      );
+      expect(f.http.calls, hasLength(1));
+      expect(f.signIns, 0);
+    },
+  );
+
   for (final seconds in [-60, 30]) {
     test(
       'JWT expiry $seconds seconds from now renews before an API request and preserves ownership',
@@ -208,6 +433,65 @@ void main() {
       },
     );
   }
+
+  test(
+    'Personal-list code 20101 renews once and retries with the same account',
+    () async {
+      final f = _Fixture();
+      f.override = (r) => _bearer(r) == 'Bearer old-token'
+          ? jsonResponse({'code': 20101, 'message': '未登录'})
+          : null;
+      await f.seed();
+      expect(await f.connector.list(_personal, '0', f.initial), hasLength(1));
+      expect(f.signIns, 1);
+      expect(f.http.calls.where((r) => r.uri.path == _list), hasLength(2));
+      expect(f.vault.credential(_platform)!.updatedAt, f.initial.updatedAt);
+      expect(f.vault.credential(_platform)!.field('userId'), '12345');
+      await f.connector.list(_personal, '0', f.initial);
+      expect(f.signIns, 1);
+    },
+  );
+
+  test('Code 20101 cannot reuse a password for a web login', () async {
+    final f = _Fixture(authType: 'webToken');
+    f.override = (_) => jsonResponse({'code': 20101, 'message': '未登录'});
+    await f.seed();
+    await expectLater(
+      f.connector.list(_personal, '0', f.initial),
+      _loginRequired('重新登录'),
+    );
+    await expectLater(
+      f.connector.authenticate(f.initial),
+      _loginRequired('重新登录'),
+    );
+    expect(f.signIns, 0);
+    expect(f.vault.credential(_platform)!.sameAs(f.initial), isTrue);
+  });
+
+  test(
+    'Code 20101 with a rejected saved password stops automatic retries',
+    () async {
+      final f = _Fixture();
+      f.override = (r) => r.uri.path.endsWith('/sign_in')
+          ? jsonResponse({'code': 11000, 'message': '登录失败'})
+          : jsonResponse({'code': 20101, 'message': '未登录'});
+      await f.seed();
+      await expectLater(
+        f.connector.list(_personal, '0', f.initial),
+        _loginRequired('自动登录失败'),
+      );
+      expect(f.signIns, 1);
+      final saved = f.vault.credential(_platform)!;
+      expect(saved.field('autoLoginBlocked'), '1');
+      expect(saved.updatedAt, f.initial.updatedAt);
+      final requests = f.http.calls.length;
+      await expectLater(
+        Pan123Connector(f.http, f.vault).list(_personal, '0', saved),
+        _loginRequired('重新登录'),
+      );
+      expect(f.http.calls.length, requests);
+    },
+  );
 
   test(
     'Concurrent quota, list and download requests share one password login',

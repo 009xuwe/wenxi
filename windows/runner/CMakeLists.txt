@@ -10,6 +10,8 @@ add_executable(${BINARY_NAME} WIN32
   "flutter_window.cpp"
   "download_power_request.cpp"
   "download_power_bridge.cpp"
+  "player_image_bridge.cpp"
+  "external_download_bridge.cpp"
   "main.cpp"
   "utils.cpp"
   "win32_window.cpp"

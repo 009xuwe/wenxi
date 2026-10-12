@@ -8,6 +8,7 @@ import 'package:share_plus/share_plus.dart';
 import '../app_services.dart';
 import '../core/json.dart';
 import '../domain/downloads.dart';
+import '../domain/baidu_share_route.dart';
 import '../domain/models.dart' show CloudPlatform;
 import '../download/completed_files.dart';
 import '../platform/file_access.dart';
@@ -15,6 +16,8 @@ import '../playback/playback_sources.dart';
 import '../playback/torrent_playback.dart';
 import '../playback/download_playback.dart';
 import 'common.dart';
+import 'download_progress.dart';
+import 'transfer_widgets.dart';
 import 'player_page.dart';
 import 'download_protection_page.dart';
 import 'uc_tv_authorization_page.dart';
@@ -121,7 +124,7 @@ class _DownloadsPageState extends State<DownloadsPage>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    _foreground = state == AppLifecycleState.resumed;
+    setState(() => _foreground = state == AppLifecycleState.resumed);
     if (_foreground) _checkFiles(force: true);
   }
 
@@ -153,7 +156,6 @@ class _DownloadsPageState extends State<DownloadsPage>
       widget.services.downloads,
       widget.services.store,
       widget.services.downloadShutdown,
-      widget.services.downloadOverlay,
       files,
     ]),
     builder: (context, _) {
@@ -171,72 +173,36 @@ class _DownloadsPageState extends State<DownloadsPage>
           final order = rank(a).compareTo(rank(b));
           return order == 0 ? b.createdAt.compareTo(a.createdAt) : order;
         });
+      final taskIndices = {
+        for (var i = 0; i < tasks.length; i++) ValueKey(tasks[i].id): i,
+      };
       return PopScope(
         canPop: !widget.active || !_selecting,
         onPopInvokedWithResult: (didPop, _) {
           if (!didPop && widget.active && _selecting) _exitSelection();
         },
         child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            SizedBox(
-              height: 50,
-              child: ListView(
-                scrollDirection: Axis.horizontal,
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 16,
-                  vertical: 8,
-                ),
-                children: List.generate(5, (i) {
-                  final selected = filter == i,
-                      count = all.where((t) => accepts(t, i)).length;
-                  final label = ['全部', '进行中', '已完成', '失败', '文件异常'][i];
-                  return Padding(
-                    padding: const EdgeInsets.only(right: 8),
-                    child: Semantics(
-                      selected: selected,
-                      button: true,
-                      child: InkWell(
-                        borderRadius: BorderRadius.circular(24),
-                        onTap: _batching
-                            ? null
-                            : () => setState(() {
-                                if (filter == i) return;
-                                filter = i;
-                                _selected.clear();
-                                _selecting = false;
-                              }),
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 11,
-                            vertical: 5,
-                          ),
-                          decoration: BoxDecoration(
-                            color: selected
-                                ? brandBlue.withValues(alpha: .16)
-                                : fill(context),
-                            borderRadius: BorderRadius.circular(24),
-                            border: Border.all(
-                              color: selected
-                                  ? brandBlue.withValues(alpha: .3)
-                                  : border(context),
-                              width: .7,
-                            ),
-                          ),
-                          child: Center(
-                            child: Text(
-                              i == 0 ? label : '$label $count',
-                              style: TextStyle(
-                                fontSize: 12,
-                                color: selected ? brandBlue : null,
-                              ),
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
-                  );
-                }),
-              ),
+            TransferFilterBar(
+              entries: [
+                for (var i = 0; i < 5; i++)
+                  (
+                    ['全部', '进行中', '已完成', '失败', '文件异常'][i],
+                    all.where((t) => accepts(t, i)).length,
+                  ),
+              ],
+              selected: filter,
+              keyPrefix: 'download-filter',
+              accent: themeAccent(context),
+              onSelected: _batching
+                  ? null
+                  : (value) => setState(() {
+                      if (filter == value) return;
+                      filter = value;
+                      _selected.clear();
+                      _selecting = false;
+                    }),
             ),
             if (_selecting)
               _selectionBar(tasks)
@@ -261,10 +227,10 @@ class _DownloadsPageState extends State<DownloadsPage>
                       isDense: true,
                       padding: const EdgeInsets.symmetric(vertical: 7),
                       iconSize: 16,
-                      iconEnabledColor: brandBlue,
+                      iconEnabledColor: themeAccent(context),
                       style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                         fontSize: 13,
-                        color: brandBlue,
+                        color: themeAccent(context),
                       ),
                       items: [
                         for (var i = 1; i <= 3; i++)
@@ -286,10 +252,10 @@ class _DownloadsPageState extends State<DownloadsPage>
                         (Platform.isAndroid || Platform.isWindows))
                       IconButton(
                         tooltip: '后台下载保护',
-                        icon: const Icon(
+                        icon: Icon(
                           CupertinoIcons.shield_lefthalf_fill,
                           size: 19,
-                          color: brandBlue,
+                          color: themeAccent(context),
                         ),
                         onPressed: () => Navigator.push<void>(
                           context,
@@ -306,9 +272,9 @@ class _DownloadsPageState extends State<DownloadsPage>
                             '${formatBytes(all.fold<int>(0, (n, t) => n + t.speed))}/s',
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
+                            style: TextStyle(
                               fontSize: 11,
-                              color: brandBlue,
+                              color: themeAccent(context),
                             ),
                           ),
                         ),
@@ -317,7 +283,6 @@ class _DownloadsPageState extends State<DownloadsPage>
                 ),
               ),
             if (widget.services.downloadShutdown.supported) _shutdownOption(),
-            if (widget.services.downloadOverlay.supported) _overlayOption(),
             Expanded(
               child: tasks.isEmpty
                   ? EmptyPanel(
@@ -336,6 +301,7 @@ class _DownloadsPageState extends State<DownloadsPage>
                           bottom: 12 + MediaQuery.paddingOf(context).bottom,
                         ),
                         itemCount: tasks.length,
+                        findChildIndexCallback: (key) => taskIndices[key],
                         itemBuilder: (context, index) =>
                             _row(context, tasks[index]),
                       ),
@@ -359,7 +325,9 @@ class _DownloadsPageState extends State<DownloadsPage>
     return Container(
       key: const Key('download-shutdown-option'),
       decoration: BoxDecoration(
-        color: shutdown.enabled ? brandBlue.withValues(alpha: .05) : null,
+        color: shutdown.enabled
+            ? themeAccent(context).withValues(alpha: .05)
+            : null,
         border: Border(bottom: BorderSide(color: border(context), width: .5)),
       ),
       padding: const EdgeInsets.fromLTRB(16, 8, 12, 8),
@@ -383,43 +351,6 @@ class _DownloadsPageState extends State<DownloadsPage>
           Switch.adaptive(
             value: shutdown.enabled,
             onChanged: shutdown.executing ? null : shutdown.setEnabled,
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _overlayOption() {
-    final overlay = widget.services.downloadOverlay;
-    return Container(
-      key: const Key('download-overlay-option'),
-      decoration: BoxDecoration(
-        border: Border(bottom: BorderSide(color: border(context), width: .5)),
-      ),
-      padding: const EdgeInsets.fromLTRB(16, 5, 12, 5),
-      child: Row(
-        children: [
-          const Icon(
-            CupertinoIcons.rectangle_on_rectangle,
-            color: brandBlue,
-            size: 20,
-          ),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text('下载悬浮窗', style: TextStyle(fontSize: 13)),
-                Text(
-                  overlay.pendingPermission ? '请允许显示在其他应用上层' : '可拖动、缩放，收起后显示进度',
-                  style: TextStyle(fontSize: 11, color: secondary(context)),
-                ),
-              ],
-            ),
-          ),
-          Switch.adaptive(
-            value: overlay.visible || overlay.pendingPermission,
-            onChanged: (_) => busy(context, overlay.toggle),
           ),
         ],
       ),
@@ -512,7 +443,7 @@ class _DownloadsPageState extends State<DownloadsPage>
                     style: TextButton.styleFrom(
                       foregroundColor: action == DownloadBatchAction.delete
                           ? Colors.red
-                          : brandBlue,
+                          : themeAccent(context),
                     ),
                     child: Column(
                       mainAxisSize: MainAxisSize.min,
@@ -675,8 +606,9 @@ class _DownloadsPageState extends State<DownloadsPage>
         ? const Color(0xffff3b30)
         : const Color(0xffff9500);
     return Material(
+      key: ValueKey(task.id),
       color: _selected.contains(task.id)
-          ? brandBlue.withValues(alpha: .08)
+          ? themeAccent(context).withValues(alpha: .08)
           : Colors.transparent,
       child: InkWell(
         key: ValueKey('download-row-${task.id}'),
@@ -693,12 +625,13 @@ class _DownloadsPageState extends State<DownloadsPage>
                 }
               },
         child: Container(
+          constraints: const BoxConstraints(minHeight: 66),
           decoration: BoxDecoration(
             border: Border(
               bottom: BorderSide(color: border(context), width: .5),
             ),
           ),
-          padding: const EdgeInsets.fromLTRB(16, 12, 14, 13),
+          padding: const EdgeInsets.fromLTRB(16, 8, 10, 8),
           child: Row(
             children: [
               if (_selecting)
@@ -714,8 +647,8 @@ class _DownloadsPageState extends State<DownloadsPage>
                   ),
                 )
               else
-                FileGlyph(task.spec.fileName, size: 32),
-              const SizedBox(width: 14),
+                FileGlyph(task.spec.fileName, size: 30),
+              const SizedBox(width: 10),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -728,8 +661,9 @@ class _DownloadsPageState extends State<DownloadsPage>
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
                             style: const TextStyle(
-                              fontSize: 15,
-                              fontWeight: FontWeight.w700,
+                              fontSize: 14,
+                              height: 1.3,
+                              fontWeight: FontWeight.w600,
                             ),
                           ),
                         ),
@@ -769,7 +703,7 @@ class _DownloadsPageState extends State<DownloadsPage>
                         ],
                       ],
                     ),
-                    const SizedBox(height: 5),
+                    const SizedBox(height: 4),
                     if (unavailable)
                       Container(
                         key: ValueKey('file-status-${task.id}'),
@@ -823,33 +757,25 @@ class _DownloadsPageState extends State<DownloadsPage>
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(
-                        fontSize: 12,
+                        fontSize: 11,
                         color: task.error.isNotEmpty
                             ? const Color(0xffff3b30)
                             : secondary(context),
                       ),
                     ),
-                    if (task.status == DownloadStatus.running)
-                      Padding(
-                        padding: const EdgeInsets.only(top: 7),
-                        child: ClipRRect(
-                          borderRadius: BorderRadius.circular(3),
-                          child: LinearProgressIndicator(
-                            value:
-                                widget.services.downloads.exportProgress(
-                                  task.id,
-                                ) ??
-                                (task.total > 0 ? task.progress : null),
-                            minHeight: 2,
-                            backgroundColor: fill(context),
-                          ),
-                        ),
-                      ),
+                    DownloadProgress(
+                      task: task,
+                      compact: true,
+                      enabled:
+                          widget.active &&
+                          _foreground &&
+                          ModalRoute.of(context)?.isCurrent != false,
+                    ),
                   ],
                 ),
               ),
               if (!_selecting) ...[
-                const SizedBox(width: 12),
+                const SizedBox(width: 6),
                 if (task.needsUcAuthorization)
                   TextButton(
                     key: ValueKey('download-authorize-${task.id}'),
@@ -859,60 +785,40 @@ class _DownloadsPageState extends State<DownloadsPage>
                     child: const Text('授权并继续'),
                   )
                 else
-                  Container(
-                    width: 32,
-                    height: 32,
-                    decoration: BoxDecoration(
-                      color: Theme.of(context).colorScheme.surface,
-                      shape: BoxShape.circle,
-                      border: Border.all(color: border(context), width: .7),
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.black.withValues(alpha: .1),
-                          blurRadius: 6,
-                          offset: const Offset(0, 2),
-                        ),
-                      ],
-                    ),
-                    child: IconButton(
-                      padding: EdgeInsets.zero,
-                      tooltip: done
-                          ? unavailable
-                                ? '查看文件异常'
-                                : Platform.isWindows &&
-                                      fileKind(task.spec.fileName) ==
-                                          FileKind.video
-                                ? '播放视频'
-                                : '打开文件'
-                          : running
-                          ? '暂停下载'
-                          : '继续下载',
-                      icon: Icon(
-                        done
-                            ? unavailable
-                                  ? CupertinoIcons.exclamationmark_circle
-                                  : Platform.isWindows &&
-                                        fileKind(task.spec.fileName) ==
-                                            FileKind.video
-                                  ? CupertinoIcons.play_rectangle
-                                  : CupertinoIcons.folder
-                            : running
-                            ? CupertinoIcons.pause
-                            : CupertinoIcons.play,
-                        size: 18,
-                        color: unavailable ? statusColor : brandBlue,
-                      ),
-                      onPressed: () => done
-                          ? unavailable
-                                ? _details(context, task.id)
-                                : _open(task)
-                          : busy(
-                              context,
-                              () => running
-                                  ? widget.services.downloads.pause(task.id)
-                                  : widget.services.downloads.resume(task.id),
-                            ),
-                    ),
+                  TransferActionButton(
+                    label: done
+                        ? unavailable
+                              ? '查看文件异常'
+                              : Platform.isWindows &&
+                                    fileKind(task.spec.fileName) ==
+                                        FileKind.video
+                              ? '播放视频'
+                              : '打开文件'
+                        : running
+                        ? '暂停下载'
+                        : '继续下载',
+                    icon: done
+                        ? unavailable
+                              ? CupertinoIcons.exclamationmark_circle
+                              : Platform.isWindows &&
+                                    fileKind(task.spec.fileName) ==
+                                        FileKind.video
+                              ? CupertinoIcons.play_rectangle
+                              : CupertinoIcons.folder
+                        : running
+                        ? CupertinoIcons.pause
+                        : CupertinoIcons.play,
+                    color: unavailable ? statusColor : themeAccent(context),
+                    onPressed: () => done
+                        ? unavailable
+                              ? _details(context, task.id)
+                              : _open(task)
+                        : busy(
+                            context,
+                            () => running
+                                ? widget.services.downloads.pause(task.id)
+                                : widget.services.downloads.resume(task.id),
+                          ),
                   ),
               ],
             ],
@@ -1023,9 +929,7 @@ class _DownloadsPageState extends State<DownloadsPage>
   }
 
   bool _isBaiduDownload(DownloadTask task) =>
-      task.spec.platform == CloudPlatform.baidu ||
-      task.spec.profile == 'baidu' ||
-      task.spec.profile == 'baidu_preview';
+      BaiduShareRoute.usesAccountDownload(task.spec);
 
   String _connectionLabel(DownloadTask task) {
     if (task.spec.isTorrent) return 'BT';
@@ -1046,7 +950,12 @@ class _DownloadsPageState extends State<DownloadsPage>
     final active = counts == null
         ? ''
         : '工作连接 ${counts.active} · 分段 ${counts.total}\n';
-    return '$active连接上限 ${task.connections} · ${task.retries} 次重试';
+    final ceiling =
+        task.spec.platform == CloudPlatform.aliyun ||
+            task.spec.profile == 'aliyun'
+        ? task.connections.clamp(1, 8)
+        : task.connections;
+    return '$active连接上限 $ceiling · ${task.retries} 次重试';
   }
 
   Future<void> _details(BuildContext context, String id) async {
