@@ -52,6 +52,8 @@ Android 构建内置友盟+移动统计 SDK，通过 Gradle 获取，版本记�
 
 ## Flutter 与 Dart 包
 
+消息公告使用 flutter_markdown_plus 1.0.12（https://github.com/foresightmobile/flutter_markdown_plus）和 markdown 7.3.1（https://github.com/dart-lang/tools/tree/main/pkgs/markdown），BSD 许可随 Flutter 构建收录。独立的公告编辑器内嵌 markdown-it 15.0.2（https://github.com/markdown-it/markdown-it），MIT 许可保留在 HTML 源码中。
+
 Flutter / Dart 保留其 BSD 许可；Cupertino Icons 为 MIT，Material Icons 为 Apache-2.0。Dio、PointyCastle、media_kit、flutter_inappwebview、flutter_secure_storage、文件选择/打开/分享、托盘及窗口插件等的准确版本记录于 pubspec.lock。其许可由 Flutter 收集并随构建保留；0.3.31 暂时移除应用内的“开源许可”菜单入口。
 
 vendor_plugins/ 中保留三项插件及 media_kit 的源码和原许可。Android media 插件使用当前 AGP 与 compileSdk，依赖下载先尝试 GitHub，再使用加速地址，并保留固定校验、超时和临时文件处理；改动记录见 vendor_plugins/media_kit_libs_android_video/ASTERLINK_PATCHES.md。media_kit 1.2.6 补充读取 libmpv 的 demux-rotation 字段，改动与上游来源记录在 vendor_plugins/media_kit/ASTERLINK_PATCHES.md，MIT 许可保留在同目录 LICENSE。上述补丁不更换媒体 native 库。
@@ -71,6 +73,8 @@ ANGLE 构建源码：https://github.com/alexmercerind/flutter-windows-ANGLE-Open
 
 ## Android NDK / Jetpack
 
+设备互联的 Android 离线扫码使用 ZXing Android Embedded 4.3.0（https://github.com/journeyapps/zxing-android-embedded）及 ZXing Core 3.4.1（https://github.com/zxing/zxing），均为 Apache-2.0；完整许可位于 assets/licenses/ZXing-LICENSE.txt。
+
 Gopeed AAR 附带 NDK 28.2.13676358 的 libc++_shared.so。LLVM 及附带组件的完整 NOTICE 位于 assets/licenses/android-ndk-NOTICE.txt，也保留在 AAR 的 META-INF/licenses/ 中。Android / Jetpack 组件保留各自的 Apache-2.0 等许可，具体依赖声明见 android/app/build.gradle.kts 与各插件构建文件。
 
 ## 字幕字体
@@ -82,6 +86,10 @@ Gopeed AAR 附带 NDK 28.2.13676358 的 libc++_shared.so。LLVM 及附带组件�
 字体 SHA-256：faa6c9df652116dde789d351359f3d7e5d2285a2b2a1f04a2d7244df706d5ea9
 
 ## 图标
+
+PikPak 接口参考 piko（https://github.com/NihilDigit/piko）使用的 pikpak-kotlin SDK，移植认证、文件、分享和上传协议；SDK 源码：https://github.com/NihilDigit/pikpak-kotlin/tree/6e1e54869acc284a6f253cdcaf7963c082d4f490，MIT 许可见 pikpak-kotlin-LICENSE.txt。
+
+PikPak 图标裁切自 OpenList 文档中的官方页面截图：https://github.com/OpenListTeam/docs/blob/main/docs/.vuepress/public/img/drivers/pikpak.png；标识权利归 PikPak 所有。
 
 各网盘标识来自用户提供的原工程与参考资源，归相应服务提供者所有，不代表官方客户端或合作关系。文析助手自 0.3.30 起采用用户提供的 `UI/图标.jpeg` 云朵、文档、放大镜与下载箭头图案，按平台生成透明边缘、压缩尺寸、自适应及单色主题资源；原始图片保留在工程中。界面测试使用本机字体生成图片，源码和应用不打包 Windows 系统字体文件。
 

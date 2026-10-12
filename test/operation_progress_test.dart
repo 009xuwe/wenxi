@@ -52,6 +52,147 @@ void main() {
     },
   );
 
+  test('file counts and retry state belong to the active read step', () async {
+    final progress = OperationProgress();
+    addTearDown(progress.dispose);
+    final release = Completer<void>();
+    final work = progress.run(
+      () => OperationProgress.step(OperationStage.readFiles, () async {
+        OperationProgress.reportFiles(400, waitingForRetry: true);
+        await release.future;
+        OperationProgress.reportFiles(600);
+      }),
+    );
+    expect(progress.value.single.itemsRead, 400);
+    expect(progress.value.single.waitingForRetry, isTrue);
+    release.complete();
+    await work;
+    expect(progress.value.single.itemsRead, 600);
+    expect(progress.value.single.waitingForRetry, isFalse);
+    expect(progress.value.single.status, OperationStepStatus.completed);
+  });
+
+  test(
+    'late file progress from a cancelled run cannot update a new run',
+    () async {
+      final progress = OperationProgress();
+      addTearDown(progress.dispose);
+      final previous = Completer<void>(), current = Completer<void>();
+      final old = progress.run(
+        () => OperationProgress.step(OperationStage.readFiles, () async {
+          OperationProgress.reportFiles(200, waitingForRetry: true);
+          await previous.future;
+          OperationProgress.reportFiles(9999);
+        }),
+      );
+      progress.close(cancelled: true);
+      expect(progress.value.single.itemsRead, 200);
+      expect(progress.value.single.status, OperationStepStatus.cancelled);
+      expect(progress.value.single.waitingForRetry, isFalse);
+      final fresh = progress.run(
+        () => OperationProgress.step(OperationStage.readFiles, () async {
+          OperationProgress.reportFiles(10);
+          await current.future;
+        }),
+      );
+      previous.complete();
+      await old;
+      expect(progress.value.single.itemsRead, 10);
+      expect(progress.value.single.status, OperationStepStatus.running);
+      current.complete();
+      await fresh;
+    },
+  );
+
+  test(
+    'parallel read steps update their own counts and stop updating after completion',
+    () async {
+      final progress = OperationProgress();
+      addTearDown(progress.dispose);
+      final first = Completer<void>(), second = Completer<void>();
+      late Zone completedZone;
+      final work = progress.run(
+        () => Future.wait([
+          OperationProgress.step(OperationStage.readFiles, () async {
+            completedZone = Zone.current;
+            OperationProgress.reportFiles(200);
+            await first.future;
+            OperationProgress.reportFiles(400);
+          }),
+          OperationProgress.step(OperationStage.readFiles, () async {
+            OperationProgress.reportFiles(10, waitingForRetry: true);
+            await second.future;
+          }),
+        ]),
+      );
+      expect(progress.value.map((step) => step.itemsRead), [200, 10]);
+      first.complete();
+      await Future<void>.delayed(Duration.zero);
+      expect(progress.value.map((step) => step.itemsRead), [400, 10]);
+      expect(progress.value.last.waitingForRetry, isTrue);
+      completedZone.run(() => OperationProgress.reportFiles(999));
+      expect(progress.value.first.itemsRead, 400);
+      second.complete();
+      await work;
+    },
+  );
+
+  test(
+    'file counts propagate through nested observers without leaking the account zone',
+    () async {
+      final outer = OperationProgress(), inner = OperationProgress();
+      addTearDown(outer.dispose);
+      addTearDown(inner.dispose);
+      final accountKey = Object();
+      final notifiedScopes = <Object?>[];
+      outer.addListener(() => notifiedScopes.add(Zone.current[accountKey]));
+      inner.addListener(() => notifiedScopes.add(Zone.current[accountKey]));
+      await outer.run(
+        () => inner.run(
+          () => runZoned(
+            () => OperationProgress.step(OperationStage.readFiles, () async {
+              OperationProgress.reportFiles(200);
+              await Future<void>.delayed(Duration.zero);
+              expect(Zone.current[accountKey], 'owner');
+              OperationProgress.reportFiles(201);
+            }),
+            zoneValues: {accountKey: 'owner'},
+          ),
+        ),
+      );
+      expect(outer.value.single.itemsRead, 201);
+      expect(inner.value.single.itemsRead, 201);
+      expect(notifiedScopes, everyElement(isNull));
+    },
+  );
+
+  test(
+    'failed reads retain the count and other stages ignore file reports',
+    () async {
+      final progress = OperationProgress();
+      addTearDown(progress.dispose);
+      await expectLater(
+        progress.run(
+          () =>
+              OperationProgress.step<void>(OperationStage.readFiles, () async {
+                OperationProgress.reportFiles(200, waitingForRetry: true);
+                throw const AppException('fixture rate limit');
+              }),
+        ),
+        throwsA(isA<AppException>()),
+      );
+      expect(progress.value.single.itemsRead, 200);
+      expect(progress.value.single.waitingForRetry, isFalse);
+      expect(progress.value.single.status, OperationStepStatus.failed);
+      await progress.run(
+        () => OperationProgress.step(OperationStage.downloadLink, () async {
+          OperationProgress.reportFiles(500);
+        }),
+      );
+      expect(progress.value.single.itemsRead, isNull);
+    },
+  );
+
   test(
     'Failure is preserved and unexecuted stages are never reported',
     () async {

@@ -1,20 +1,39 @@
+import 'dart:async';
+import 'dart:io';
 import 'dart:math' as math;
 import '../../core/json.dart';
 import '../../core/operation_progress.dart';
+import '../../diagnostics/app_log.dart';
 import '../../domain/auth.dart';
 import '../../domain/file_types.dart';
 import '../../domain/models.dart';
 import '../../domain/uploads.dart';
 import '../http.dart';
+import '../http_retry.dart';
 import '../uploads/upload_io.dart';
 import '../state_store.dart';
 import 'aliyun_signature.dart';
 import 'token_session.dart';
 
 class AliyunApiException extends AppException {
-  const AliyunApiException(super.message, this.code, {this.status});
+  const AliyunApiException(
+    super.message,
+    this.code, {
+    this.status,
+    this.retryAfter = '',
+  });
   final String code;
   final int? status;
+  final String retryAfter;
+
+  bool get rateLimited =>
+      status == 429 ||
+      code.toLowerCase().contains('toomanyrequests') ||
+      message.toLowerCase().contains('toomanyrequests');
+}
+
+class _AliyunListRead {
+  int pages = 0, items = 0, retries = 0;
 }
 
 class AliyunConnector extends CloudConnector {
@@ -23,12 +42,27 @@ class AliyunConnector extends CloudConnector {
     CredentialStore store, {
     this.stageCleanup,
     this.taskDelay = const Duration(milliseconds: 750),
+    this.listRequestInterval = const Duration(seconds: 1),
+    this.listWait = RequestScope.wait,
+    this.albumLookupTimeout = const Duration(seconds: 5),
     int Function()? now,
   }) : sessions = TokenSessions(CloudPlatform.aliyun, store, now: now);
   final JsonHttp http;
   final TokenSessions sessions;
   final Future<void> Function(DownloadCleanup)? stageCleanup;
   final Duration taskDelay;
+  final Duration listRequestInterval;
+  final Future<void> Function(Duration) listWait;
+  final Duration albumLookupTimeout;
+  final _albumGate = AsyncGate();
+  final _albumRetryAfter = <String, int>{};
+  // Browsing, search and upload name checks share a list request queue. Keep it
+  // separate from the token gate, which can be acquired by the request itself.
+  final _listGate = AsyncGate();
+  final _listIdle = Stopwatch();
+  Duration _listPause = Duration.zero;
+  bool _listCoolingDown = false;
+  static const _listRetryDelays = [2, 5, 10];
   static const api = 'https://api.aliyundrive.com';
   static const web = 'https://www.alipan.com';
   static const downloadCanary = 'client=Android,app=adrive,version=v4.1.0';
@@ -75,13 +109,17 @@ class AliyunConnector extends CloudConnector {
     'InvalidDeviceSession',
   }.contains(data.str('code'));
 
-  Json _checked(HttpResult response, Json data) {
+  Json _checked(
+    HttpResult response,
+    Json data, {
+    Set<String> successCodes = const {'0'},
+  }) {
     if (_authError(response, data)) {
       throw const AccountLoginRequired('阿里云盘登录已过期，请重新网页登录');
     }
     final code = data.str('code');
     if (!response.successful ||
-        code.isNotEmpty && code != '0' ||
+        code.isNotEmpty && !successCodes.contains(code) ||
         data['success'] == false) {
       final message = switch (code) {
         'InvalidResource.SharePwd' => '阿里分享提取码错误或缺失',
@@ -102,7 +140,12 @@ class AliyunConnector extends CloudConnector {
                 '阿里云盘请求失败（HTTP ${response.status}${code.isEmpty ? '' : '，$code'}）',
               ),
       };
-      throw AliyunApiException(message, code, status: response.status);
+      throw AliyunApiException(
+        message,
+        code,
+        status: response.status,
+        retryAfter: response.header('retry-after'),
+      );
     }
     return data;
   }
@@ -201,6 +244,7 @@ class AliyunConnector extends CloudConnector {
     bool signed = true,
     String shareToken = '',
     String? canary,
+    Set<String> successCodes = const {'0'},
   }) async {
     if (session != null) {
       await sessions.fresh(session, _renew);
@@ -231,6 +275,7 @@ class AliyunConnector extends CloudConnector {
             '阿里云盘接口返回异常（HTTP ${response.status}）',
             'InvalidResponse',
             status: response.status,
+            retryAfter: response.header('retry-after'),
           );
         }
         data = {};
@@ -250,7 +295,7 @@ class AliyunConnector extends CloudConnector {
         await _device(session, rejected: deviceSession);
         continue;
       }
-      return _checked(response, data);
+      return _checked(response, data, successCodes: successCodes);
     }
     throw const AccountLoginRequired('阿里云盘会话失效，请重新网页登录');
   }
@@ -322,6 +367,69 @@ class AliyunConnector extends CloudConnector {
   Future<CloudAccount> account(Credential credential) async =>
       _account(await _session(credential));
 
+  Future<void> _albumInfo(TokenSession session) => RequestScope.cancellable(
+    _albumGate.run(() async {
+      sessions.checkpoint(session);
+      final now = sessions.now(), owner = session.field('userId');
+      final checked = int.tryParse(session.field('albumDriveCheckedAt'));
+      if (checked != null && now >= checked && now - checked < 300000 ||
+          (_albumRetryAfter[owner] ?? 0) > now) {
+        return;
+      }
+      // Album metadata uses a separate API. Keep this optional lookup bounded
+      // so an unavailable album service cannot block the ordinary drives.
+      final lookup = RequestScope(), parent = RequestScope.current;
+      var finished = false, timedOut = false;
+      parent?.whenCancel.then((_) {
+        if (!finished) lookup.cancel();
+      });
+      final timer = Timer(albumLookupTimeout, () {
+        timedOut = true;
+        lookup.cancel();
+      });
+      try {
+        await lookup.run(
+          () => RequestScope.cancellable(() async {
+            final response = await _post(
+              '/adrive/v1/user/albums_info',
+              {},
+              session: session,
+              read: true,
+              successCodes: const {'0', '200'},
+            );
+            final data = response.obj('data');
+            require(data['driveId'] is String, '阿里云盘未返回有效相册空间');
+            await sessions.update(session, {
+              'albumDriveId': data.str('driveId'),
+              'albumDriveCheckedAt': '${sessions.now()}',
+            });
+            _albumRetryAfter.remove(owner);
+          }()),
+        );
+      } on AccountLoginRequired {
+        rethrow;
+      } on AppException catch (error) {
+        // Recheck the original scope and account before treating an error as
+        // optional. Cancellation and account changes must still propagate.
+        sessions.checkpoint(session);
+        _albumRetryAfter[owner] = sessions.now() + 30000;
+        DiagnosticLog.event(
+          'aliyun.album.discovery_unavailable',
+          fields: {
+            'timedOut': timedOut,
+            'usingSavedSpace': session.field('albumDriveId').isNotEmpty,
+            if (error is AliyunApiException) 'status': error.status,
+            if (error is AliyunApiException) 'code': error.code,
+          },
+        );
+      } finally {
+        finished = true;
+        timer.cancel();
+        lookup.cancel();
+      }
+    }),
+  );
+
   List<CloudSpace> _spaces(TokenSession session) {
     final result = <CloudSpace>[], ids = <String>{};
     for (final pair in [
@@ -331,6 +439,7 @@ class AliyunConnector extends CloudConnector {
         '备份盘',
       ),
       (session.field('defaultDriveId'), '个人盘'),
+      (session.field('albumDriveId'), '相册'),
     ]) {
       if (pair.$1.isNotEmpty && ids.add(pair.$1)) {
         result.add(CloudSpace(pair.$1, pair.$2));
@@ -352,6 +461,7 @@ class AliyunConnector extends CloudConnector {
   Future<List<CloudSpace>> personalSpaces(Credential credential) async {
     final session = await _session(credential);
     await _driveInfo(session);
+    await _albumInfo(session);
     return _spaces(session);
   }
 
@@ -453,6 +563,120 @@ class AliyunConnector extends CloudConnector {
     );
   }
 
+  Duration _listRetryAfter(String value) {
+    final seconds = int.tryParse(value.trim());
+    if (seconds != null && seconds >= 0) {
+      return Duration(seconds: seconds.clamp(0, 86400));
+    }
+    try {
+      final remaining = HttpDate.parse(
+        value,
+      ).difference(DateTime.now().toUtc());
+      return remaining.isNegative ? Duration.zero : remaining;
+    } catch (_) {
+      return Duration.zero;
+    }
+  }
+
+  Future<Json> _listPage(
+    String path,
+    Json body,
+    _AliyunListRead read, {
+    TokenSession? session,
+    String shareToken = '',
+  }) => RequestScope.cancellable(
+    _listGate.run(() async {
+      while (true) {
+        RequestScope.checkpoint();
+        if (session != null) sessions.checkpoint(session);
+        final remaining = _listPause - _listIdle.elapsed;
+        OperationProgress.reportFiles(
+          read.items,
+          waitingForRetry: _listCoolingDown && remaining > Duration.zero,
+        );
+        if (_listCoolingDown && remaining > const Duration(seconds: 30)) {
+          throw const AliyunApiException(
+            '阿里云盘读取文件列表过于频繁，请稍后再试',
+            'TooManyRequests',
+          );
+        }
+        if (_listIdle.isRunning && remaining > Duration.zero) {
+          await listWait(remaining);
+        }
+        RequestScope.checkpoint();
+        if (session != null) sessions.checkpoint(session);
+        OperationProgress.reportFiles(read.items);
+        _listPause = listRequestInterval;
+        _listCoolingDown = false;
+        AliyunApiException limited;
+        var sharedRetriesExhausted = false;
+        try {
+          return await _post(
+            path,
+            body,
+            session: session,
+            shareToken: shareToken,
+            read: true,
+          );
+        } on AliyunApiException catch (error) {
+          if (!error.rateLimited) rethrow;
+          limited = error;
+        } on HttpRequestFailure catch (error) {
+          if (error.status != 429) rethrow;
+          limited = AliyunApiException(
+            error.message,
+            'TooManyRequests',
+            status: error.status,
+            retryAfter: error.retryAfter,
+          );
+          // Preparation already has an HTTP retry budget. Do not replay that
+          // exhausted budget in a second retry loop.
+          sharedRetriesExhausted = ReadRetryScope.current != null;
+        } finally {
+          _listIdle
+            ..reset()
+            ..start();
+        }
+        RequestScope.checkpoint();
+        final normal = Duration(
+          seconds:
+              _listRetryDelays[math.min(
+                read.retries,
+                _listRetryDelays.length - 1,
+              )],
+        );
+        final server = _listRetryAfter(limited.retryAfter);
+        _listPause = server > normal ? server : normal;
+        if (_listPause < listRequestInterval) _listPause = listRequestInterval;
+        _listCoolingDown = true;
+        final exhausted =
+            read.retries >= _listRetryDelays.length ||
+            sharedRetriesExhausted ||
+            server > const Duration(seconds: 30);
+        DiagnosticLog.event(
+          'aliyun.list.throttled',
+          fields: {
+            'page': read.pages + 1,
+            'itemsRead': read.items,
+            'retries': read.retries,
+            'status': limited.status,
+            'waitMs': _listPause.inMilliseconds,
+            'willRetry': !exhausted,
+          },
+        );
+        if (exhausted) {
+          throw AliyunApiException(
+            '阿里云盘读取文件列表过于频繁，请稍后再试',
+            'TooManyRequests',
+            status: limited.status,
+            retryAfter: limited.retryAfter,
+          );
+        }
+        read.retries++;
+      }
+    }),
+  );
+
   Future<List<CloudFile>> _list(
     String parent, {
     TokenSession? session,
@@ -461,45 +685,79 @@ class AliyunConnector extends CloudConnector {
     String shareToken = '',
   }) async {
     final result = <CloudFile>[], ids = <String>{}, markers = <String>{};
+    final read = _AliyunListRead();
     var marker = '';
-    for (var page = 0; page < 1000; page++) {
-      final data = await _post(
-        shareId.isNotEmpty
-            ? '/adrive/v2/file/list_by_share'
-            : '/adrive/v3/file/list',
-        {
-          if (shareId.isNotEmpty) 'share_id': shareId else 'drive_id': drive,
-          'parent_file_id': parent,
-          'limit': 100,
-          'marker': marker,
-          'all': false,
-          'fields': '*',
-          'url_expire_sec': 14400,
-          'order_by': 'name',
-          'order_direction': 'ASC',
-        },
-        session: session,
-        shareToken: shareToken,
-        read: true,
-      );
-      require(
-        data['items'] is List &&
-            (data['items'] as List).every((item) => item is Map),
-        '阿里云盘未返回有效文件列表，请重试',
-      );
-      var added = 0;
-      for (final raw in data.list('items')) {
-        final item = file(raw, parent);
-        if (ids.add(item.id)) {
-          result.add(item);
-          added++;
+    try {
+      for (var page = 0; page < 1000; page++) {
+        final data = await _listPage(
+          shareId.isNotEmpty
+              ? '/adrive/v2/file/list_by_share'
+              : '/adrive/v3/file/list',
+          {
+            if (shareId.isNotEmpty) 'share_id': shareId else 'drive_id': drive,
+            'parent_file_id': parent,
+            'limit': 200,
+            'marker': marker,
+            'all': false,
+            'fields': '*',
+            'url_expire_sec': 14400,
+            'order_by': 'name',
+            'order_direction': 'ASC',
+          },
+          read,
+          session: session,
+          shareToken: shareToken,
+        );
+        require(
+          data['items'] is List &&
+              (data['items'] as List).every((item) => item is Map),
+          '阿里云盘未返回有效文件列表，请重试',
+        );
+        var added = 0;
+        for (final raw in data.list('items')) {
+          final item = file(raw, parent);
+          if (ids.add(item.id)) {
+            result.add(item);
+            added++;
+          }
         }
+        RequestScope.checkpoint();
+        read.pages++;
+        read.items = result.length;
+        OperationProgress.reportFiles(read.items);
+        marker = data.str('next_marker');
+        if (marker.isEmpty) {
+          if (read.pages > 1 || read.retries > 0) {
+            DiagnosticLog.event(
+              'aliyun.list.completed',
+              fields: {
+                'pages': read.pages,
+                'itemsRead': read.items,
+                'retries': read.retries,
+              },
+            );
+          }
+          return result;
+        }
+        require(added > 0 && markers.add(marker), '阿里云盘分页重复，请刷新列表重试');
       }
-      marker = data.str('next_marker');
-      if (marker.isEmpty) return result;
-      require(added > 0 && markers.add(marker), '阿里云盘分页重复，请刷新列表重试');
+      throw const AppException('阿里目录项目过多，请分目录打开');
+    } catch (error, stack) {
+      if (RequestScope.current?.isCancelled != true) {
+        DiagnosticLog.error(
+          'aliyun.list.failed',
+          error,
+          stack,
+          fields: {
+            'page': read.pages + 1,
+            'itemsRead': read.items,
+            'retries': read.retries,
+            'mode': shareId.isEmpty ? 'personal' : 'share',
+          },
+        );
+      }
+      rethrow;
     }
-    throw const AppException('阿里目录项目过多，请分目录打开');
   }
 
   @override

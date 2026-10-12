@@ -165,12 +165,18 @@ class OperationProgressView extends StatelessWidget {
       );
 }
 
-String _stepLabel(OperationStep step) => switch (step.status) {
-  OperationStepStatus.running => step.stage.runningLabel,
-  OperationStepStatus.completed => '${step.stage.label} · 完成',
-  OperationStepStatus.failed => '${step.stage.label} · 未完成',
-  OperationStepStatus.cancelled => '${step.stage.label} · 已取消',
-};
+String _stepLabel(OperationStep step) {
+  final label = switch (step.status) {
+    OperationStepStatus.running =>
+      step.waitingForRetry ? '请求较频繁，正在等待重试…' : step.stage.runningLabel,
+    OperationStepStatus.completed => '${step.stage.label} · 完成',
+    OperationStepStatus.failed => '${step.stage.label} · 未完成',
+    OperationStepStatus.cancelled => '${step.stage.label} · 已取消',
+  };
+  return step.stage == OperationStage.readFiles && step.itemsRead != null
+      ? '$label · 已读取 ${step.itemsRead} 项'
+      : label;
+}
 
 class _StepRow extends StatelessWidget {
   const _StepRow({

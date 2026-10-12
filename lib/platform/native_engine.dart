@@ -171,6 +171,7 @@ class DesktopGopeedTransport extends NativeTransport {
 
 /// Cold deletion records a marker; it never loads JNI just to remove a row.
 class GopeedEngine {
+  static const destinationCacheName = '.asterlink-cache';
   GopeedEngine(
     this.transport,
     this.store,
@@ -184,6 +185,7 @@ class GopeedEngine {
   final Directory storage, cache;
   final _gate = AsyncGate();
   bool _started = false;
+  bool? _taskCacheRootsSupported;
   void validateId(String id) =>
       require(RegExp(r'^[A-Za-z0-9_-]{1,100}$').hasMatch(id), '无效的下载任务编号');
   Future<void> _start() async {
@@ -201,6 +203,7 @@ class GopeedEngine {
         'key': key,
       });
       _started = true;
+      _taskCacheRootsSupported = null;
     }
     final pending = (store.data['nativeRemovals'] as List? ?? [])
         .map((e) => e.toString())
@@ -271,7 +274,8 @@ class GopeedEngine {
   });
 
   Future<void> begin(Json request) => _gate.run(() async {
-    validateId(request.str('id'));
+    final id = request.str('id');
+    validateId(id);
     await _start();
     require(
       !(store.data['nativeRemovals'] as List? ?? []).contains(
@@ -279,7 +283,19 @@ class GopeedEngine {
       ),
       '此任务的旧下载缓存尚未清理，请重试',
     );
-    await transport.call('begin', request);
+    final root = taskCacheRoot(id);
+    final customCache = !p.equals(root.path, cache.path);
+    if (customCache) {
+      _taskCacheRootsSupported ??= asJson(
+        await transport.call('version'),
+      ).boolean('taskCacheRoots');
+      require(_taskCacheRootsSupported!, '下载组件版本过旧，无法使用所选目录作为缓存，请安装完整新版应用');
+      await checkedTaskDirectory(id, create: true);
+    }
+    await transport.call('begin', {
+      ...request,
+      if (customCache) 'cacheRoot': root.path,
+    });
   });
   Future<Json> snapshot(String id) => _gate.run(() async {
     validateId(id);
@@ -310,10 +326,55 @@ class GopeedEngine {
     await transport.dispose();
     _started = false;
   });
-  Directory taskDirectory(String id) {
+  Directory taskCacheRoot(String id) {
     validateId(id);
-    final path = p.normalize(p.join(cache.path, id));
-    require(p.equals(p.dirname(path), p.normalize(cache.path)), '无效的缓存路径');
+    final roots = store.data['downloadCacheRoots'];
+    final value = roots is Map ? roots[id] : null;
+    if (value == null) return cache;
+    require(
+      value is String &&
+          p.isAbsolute(value) &&
+          p.basename(p.normalize(value)) == destinationCacheName,
+      '下载缓存目录无效，请重新添加任务',
+    );
+    return Directory(p.normalize(value as String));
+  }
+
+  Directory taskDirectory(String id) {
+    final root = taskCacheRoot(id);
+    final path = p.normalize(p.join(root.path, id));
+    require(p.equals(p.dirname(path), p.normalize(root.path)), '无效的缓存路径');
     return Directory(path);
+  }
+
+  Future<Directory?> checkedTaskDirectory(
+    String id, {
+    bool create = false,
+  }) async {
+    final root = taskCacheRoot(id), directory = taskDirectory(id);
+    for (final item in [root, directory]) {
+      var type = await FileSystemEntity.type(item.path, followLinks: false);
+      if (type == FileSystemEntityType.notFound) {
+        if (!create) return null;
+        await item.create(recursive: true);
+        type = await FileSystemEntity.type(item.path, followLinks: false);
+      }
+      // Existing installations may redirect the legacy cache root. Keep that
+      // compatibility; a task directory itself must never be a link.
+      if (identical(item, root) &&
+          p.equals(root.path, cache.path) &&
+          type == FileSystemEntityType.link &&
+          await root.exists()) {
+        continue;
+      }
+      require(type == FileSystemEntityType.directory, '下载缓存路径发生变化，已停止操作');
+    }
+    final resolvedRoot = await root.resolveSymbolicLinks();
+    final resolvedTask = await directory.resolveSymbolicLinks();
+    require(
+      p.equals(resolvedTask, p.join(resolvedRoot, id)),
+      '下载缓存路径发生变化，已停止操作',
+    );
+    return directory;
   }
 }

@@ -103,6 +103,25 @@ void main() {
     });
   }
 
+  scenario(
+    'Dismissing during manual installation validation does not launch later',
+    (tester) async {
+      await render(tester);
+      await f.service.start(f.current!);
+      f.complete();
+      await tester.pumpAndSettle();
+      f.installer.pending = Completer<void>();
+      await tester.tap(inApp);
+      await tester.pump();
+      expect(f.installer.preparations, 1);
+      Navigator.of(tester.element(dialog)).pop();
+      await tester.pumpAndSettle();
+      f.installer.pending!.complete();
+      await tester.pumpAndSettle();
+      expect(f.installer.opens, 0);
+    },
+  );
+
   scenario('App download shows progress and Android launches installer once', (
     tester,
   ) async {
@@ -134,6 +153,32 @@ void main() {
     expect(f.installer.opens, 1);
     expect(find.text('立即安装'), findsOneWidget);
     expect(control.unreadUpdate, isNotNull);
+  });
+
+  scenario('Failed updates offer both resume and a fresh share download', (
+    tester,
+  ) async {
+    await render(tester);
+    await tester.tap(inApp);
+    await tester.pumpAndSettle();
+    final oldId = f.downloads.tasks.single.id;
+    f.downloads.change(oldId, {'status': 'failed', 'error': '文件已更新，请重新下载'});
+    await tester.pumpAndSettle();
+    expect(find.text('重试下载'), findsOneWidget);
+    expect(find.text('重新下载'), findsOneWidget);
+    f.connector.entries = [
+      const CloudFile(id: 'fresh', name: 'fresh.apk', size: 2048),
+    ];
+    await tester.tap(find.byKey(const ValueKey('control-update-redownload')));
+    await tester.pumpAndSettle();
+    expect(f.downloads.created, 2);
+    expect(f.downloads.resumed, 0);
+    expect(f.downloads.task(oldId), isNull);
+    expect(find.text('fresh.apk'), findsOneWidget);
+    expect(find.text('文件已更新，请重新下载'), findsNothing);
+    f.complete();
+    await tester.pumpAndSettle();
+    expect(f.installer.opens, 1);
   });
 
   scenario(

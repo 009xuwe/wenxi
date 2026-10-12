@@ -4,6 +4,7 @@ import '../core/operation_progress.dart';
 import '../diagnostics/app_log.dart';
 import '../download/download_request.dart';
 import '../domain/models.dart';
+import '../domain/baidu_share_route.dart';
 import '../domain/uploads.dart';
 import '../domain/auth.dart';
 import '../domain/downloads.dart';
@@ -12,8 +13,12 @@ import 'http.dart';
 import 'http_retry.dart';
 import 'cleanup_outbox.dart';
 import 'providers/baidu.dart';
+import 'providers/baidu_public_parser.dart';
+import 'providers/baidu_public_password.dart';
 import 'providers/ctfile.dart';
 import 'providers/feijipan.dart';
+import 'providers/pikpak.dart';
+import 'providers/github.dart';
 import 'providers/quark.dart';
 import 'providers/uc.dart';
 import 'providers/pan123.dart';
@@ -30,7 +35,7 @@ import 'providers/pan115.dart';
 import 'providers/xunlei.dart';
 import 'providers/xunlei_protocol.dart';
 import 'providers/xunlei_login.dart';
-import '../domain/xunlei_kouling.dart';
+import 'cloud_command_resolver.dart';
 
 class CloudRepository {
   CloudRepository(
@@ -41,17 +46,26 @@ class CloudRepository {
     this.preparationRetries,
     this.retryWait,
     this.directShareDownloadEnabled,
+    DateTime Function()? clock,
   }) : http = transport is RetryingJsonHttp
            ? transport
            : RetryingJsonHttp(transport) {
     final devices = XunleiDevices(vault);
+    publicPasswords = BaiduPublicPasswords(http, store: vault, clock: clock);
     connectors = {
+      CloudPlatform.github: GitHubConnector(http),
+      CloudPlatform.pikpak: PikPakConnector(
+        http,
+        vault,
+        stageCleanup: _stageCleanup,
+      ),
       CloudPlatform.feijipan: FeijipanConnector(http, vault),
       CloudPlatform.ctfile: CtfileConnector(http),
       CloudPlatform.baidu: BaiduConnector(
         http,
         store: vault,
         stageCleanup: _stageCleanup,
+        publicParser: BaiduPublicParser(http, passwords: publicPasswords),
       ),
       CloudPlatform.quark: QuarkConnector(
         http,
@@ -125,6 +139,7 @@ class CloudRepository {
               CloudPlatform.xunlei,
               CloudPlatform.aliyun,
               CloudPlatform.guangya,
+              CloudPlatform.pikpak,
             }.contains(platform) &&
             action.str('kind') == 'temporary-folder',
         '无法识别云端清理任务',
@@ -167,6 +182,14 @@ class CloudRepository {
           );
           return;
         }
+        if (platform == CloudPlatform.pikpak) {
+          await (connector(platform) as PikPakConnector).deleteTemporaryFolder(
+            id,
+            action.str('name'),
+            credential(platform),
+          );
+          return;
+        }
         if (platform == CloudPlatform.aliyun) {
           await (connector(platform) as AliyunConnector).deleteTemporaryFolder(
             session,
@@ -199,6 +222,7 @@ class CloudRepository {
   final JsonHttp http;
   final CredentialStore vault;
   final CleanupOutbox cleanups;
+  late final BaiduPublicPasswords publicPasswords;
   final void Function(CloudPlatform)? checkAccess;
   final int Function()? preparationRetries;
   final Future<void> Function(Duration)? retryWait;
@@ -348,16 +372,22 @@ class CloudRepository {
           ),
   );
 
-  Future<BrowseSession> share(ParsedLink link) async {
+  Future<BrowseSession> share(
+    ParsedLink link, {
+    BaiduShareRoute baiduRoute = BaiduShareRoute.publicParser,
+  }) async {
     final p = link.platform;
     require(p != null, '此链接不是支持的网盘分享');
     require(p!.supportsShareParsing, p.shareUnavailableMessage);
     return _withAccount(p, _currentId(p), () async {
       ensureAvailable(p);
       final account = vault.credential(p);
+      final provider = connector(p);
       final result = await OperationProgress.step(
         OperationStage.verifyShare,
-        () => connector(p).openShare(link, account),
+        () => provider is BaiduConnector
+            ? provider.openShare(link, account, route: baiduRoute)
+            : provider.openShare(link, account),
       );
       ensureAvailable(p);
       require(
@@ -368,16 +398,11 @@ class CloudRepository {
     });
   }
 
-  Future<String> resolveXunleiKouling(String keyword) async {
-    final response = await http
-        .get(XunleiKouling.jumpUrl(XunleiKouling.normalize(keyword)), {
-          'User-Agent': XunleiKouling.userAgent,
-          'Accept': '*/*',
-          'Origin': XunleiKouling.origin,
-          'Referer': XunleiKouling.referer,
-          'Accept-Language': 'zh-CN',
-        });
-    return XunleiKouling.shareUrlFromResponse(response.status, response.json)!;
+  Future<ParsedLink> resolveCommand(CloudPlatform platform, String text) async {
+    ensureAvailable(platform);
+    final result = await CloudCommandResolver(http).resolve(platform, text);
+    ensureAvailable(platform);
+    return result;
   }
 
   Future<List<CloudFile>> list(BrowseSession session, String parent) =>
@@ -407,31 +432,26 @@ class CloudRepository {
     BrowseSession session,
     String parent,
     String name,
-  ) => _writeFile(
-    session,
-    parent,
-    name,
-    (provider, account) =>
-        provider.createFolder(session, parent, name, account),
-  );
+  ) => _writeFile(session, parent, name, (provider, account) {
+    require(provider.canCreateFolderIn(session, parent), '当前目录不支持创建文件夹');
+    return provider.createFolder(session, parent, name, account);
+  });
 
   Future<CloudFile> upload(
     BrowseSession session,
     String parent,
     UploadFile source, {
     UploadProgressCallback? onProgress,
-  }) => _writeFile(
-    session,
-    parent,
-    source.name,
-    (provider, account) => provider.upload(
+  }) => _writeFile(session, parent, source.name, (provider, account) {
+    require(provider.canUploadTo(session, parent), '当前目录不支持上传，请先进入代码目录或发布附件');
+    return provider.upload(
       session,
       parent,
       source.guarded(RequestScope.checkpoint),
       account,
       onProgress: onProgress,
-    ),
-  );
+    );
+  });
 
   Future<CloudFile> _writeFile(
     BrowseSession session,
@@ -485,6 +505,9 @@ class CloudRepository {
           url: '',
           fileName: file.name,
           expectedSize: session.platform.exactFileSize ? file.size : 0,
+          profile: BaiduShareRoute.usesPublicParser(session)
+              ? BaiduShareRoute.publicDownloadProfile
+              : null,
           checksumType: file.hashType,
           checksumValue: file.hashValue,
           source: DownloadOrigin(
@@ -659,6 +682,7 @@ class CloudRepository {
           final provider = connector(origin.session.platform);
           if (provider is BaiduConnector &&
               origin.session.mode == BrowseMode.share &&
+              !BaiduShareRoute.usesPublicParser(origin.session) &&
               !previous.needsPreparation) {
             final reused = await provider.refreshTransfer(
               previous,
@@ -735,7 +759,10 @@ class CloudRepository {
             link.kind == LinkKind.cloudShare,
         '原分享信息已缺失，请重新解析分享链接',
       );
-      session = await share(link!);
+      session = await share(
+        link!,
+        baiduRoute: BaiduShareRoute.fromSession(origin.session),
+      );
     } else {
       session = await reopenSpace(origin.session);
     }
@@ -811,10 +838,17 @@ class CloudRepository {
   ) async {
     ensureAvailable(session.platform);
     final result = <(CloudFile, String)>[], visited = <String>{};
+    final watch = Stopwatch()..start();
     Future<void> walk(CloudFile file, String relative, int depth) async {
+      RequestScope.checkpoint();
       require(depth <= 32 && result.length < 10000, '目录层级或文件数量过多，请分批下载');
+      require(
+        connector(session.platform).canDownloadFile(session, file),
+        '请先进入代码目录或发布附件列表再选择下载，也可下载仓库源码 ZIP',
+      );
       if (!file.isDirectory) {
         result.add((file, relative));
+        if (result.length % 128 == 0) await RequestScope.wait(Duration.zero);
         return;
       }
       final id = directoryId(session, file);
@@ -828,6 +862,15 @@ class CloudRepository {
     for (final file in selected) {
       await walk(file, '', 0);
     }
+    DiagnosticLog.event(
+      'download.files_collected',
+      fields: {
+        'platform': session.platform.key,
+        'files': result.length,
+        'folders': visited.length,
+        'elapsedMs': watch.elapsedMilliseconds,
+      },
+    );
     return result;
   }
 }

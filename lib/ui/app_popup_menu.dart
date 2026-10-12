@@ -25,12 +25,14 @@ class AppPopupMenuButton<T> extends StatelessWidget {
     required this.icon,
     required this.actions,
     required this.onSelected,
+    this.label,
   });
 
   final String tooltip;
   final IconData icon;
   final List<AppMenuAction<T>> actions;
   final ValueChanged<T> onSelected;
+  final String? label;
 
   @override
   Widget build(BuildContext context) {
@@ -52,15 +54,42 @@ class AppPopupMenuButton<T> extends StatelessWidget {
       clipBehavior: Clip.antiAlias,
       constraints: const BoxConstraints(minWidth: 224, maxWidth: 320),
       menuPadding: const EdgeInsets.all(6),
-      icon: Container(
-        width: 32,
-        height: 32,
-        decoration: BoxDecoration(
-          color: brandBlue.withValues(alpha: dark ? .14 : .07),
-          borderRadius: BorderRadius.circular(10),
-        ),
-        child: Icon(icon, color: brandBlue, size: 21),
-      ),
+      icon: label != null
+          ? null
+          : Container(
+              width: 32,
+              height: 32,
+              decoration: BoxDecoration(
+                color: themeAccent(context).withValues(alpha: dark ? .14 : .07),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Icon(icon, color: themeAccent(context), size: 21),
+            ),
+      child: label == null
+          ? null
+          : Container(
+              margin: const EdgeInsets.symmetric(horizontal: 4, vertical: 6),
+              padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 8),
+              decoration: BoxDecoration(
+                color: themeAccent(context).withValues(alpha: dark ? .14 : .07),
+                borderRadius: BorderRadius.circular(11),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(icon, color: themeAccent(context), size: 20),
+                  const SizedBox(width: 5),
+                  Text(
+                    label!,
+                    style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                      color: themeAccent(context),
+                    ),
+                  ),
+                ],
+              ),
+            ),
       itemBuilder: (context) => [
         for (final action in actions)
           PopupMenuItem<T>(
@@ -75,7 +104,7 @@ class AppPopupMenuButton<T> extends StatelessWidget {
                 ),
                 decoration: BoxDecoration(
                   color: action.selected
-                      ? brandBlue.withValues(alpha: dark ? .16 : .07)
+                      ? themeAccent(context).withValues(alpha: dark ? .16 : .07)
                       : null,
                   borderRadius: BorderRadius.circular(10),
                 ),
@@ -85,10 +114,16 @@ class AppPopupMenuButton<T> extends StatelessWidget {
                       width: 30,
                       height: 30,
                       decoration: BoxDecoration(
-                        color: brandBlue.withValues(alpha: dark ? .14 : .08),
+                        color: themeAccent(
+                          context,
+                        ).withValues(alpha: dark ? .14 : .08),
                         borderRadius: BorderRadius.circular(9),
                       ),
-                      child: Icon(action.icon, color: brandBlue, size: 18),
+                      child: Icon(
+                        action.icon,
+                        color: themeAccent(context),
+                        size: 18,
+                      ),
                     ),
                     const SizedBox(width: 12),
                     Expanded(
@@ -100,7 +135,7 @@ class AppPopupMenuButton<T> extends StatelessWidget {
                               ? FontWeight.w600
                               : FontWeight.w500,
                           color: action.selected
-                              ? brandBlue
+                              ? themeAccent(context)
                               : theme.colorScheme.onSurface,
                         ),
                       ),
@@ -109,14 +144,17 @@ class AppPopupMenuButton<T> extends StatelessWidget {
                       const SizedBox(width: 12),
                       Text(
                         action.detail!,
-                        style: const TextStyle(fontSize: 12, color: brandBlue),
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: themeAccent(context),
+                        ),
                       ),
                     ],
                     if (action.selected) ...[
                       const SizedBox(width: 8),
-                      const Icon(
+                      Icon(
                         CupertinoIcons.checkmark,
-                        color: brandBlue,
+                        color: themeAccent(context),
                         size: 16,
                       ),
                     ],

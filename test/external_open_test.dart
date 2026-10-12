@@ -23,6 +23,37 @@ void main() {
   ExternalOpenRequest request(Map<String, Object?> value) =>
       ExternalOpenRequest.fromPlatform({'id': 'external-1', ...value});
 
+  test('Windows download calls decode once and preserve signed queries', () {
+    const url = 'https://example.test/原文件.apk?token=a%2Bb%26c&part=1';
+    final launch = Uri(
+      scheme: 'wenxi',
+      host: 'download',
+      queryParameters: {'url': url, 'name': '测试包.apk'},
+    ).toString();
+    final parsed = request({'launchUri': launch});
+    expect(parsed.kind, ExternalOpenKind.download);
+    expect(parsed.uri, url);
+    expect(parsed.name, '测试包.apk');
+    expect(parsed.headers, isEmpty);
+    expect(request({'launchUri': url}).downloadUrl, url);
+  });
+
+  test(
+    'Windows protocol rejects local paths, other actions and duplicate URLs',
+    () {
+      for (final value in [
+        'wenxi://download?url=file%3A%2F%2F%2FC%3A%2Fprivate.txt',
+        'wenxi://download?url=https%3A%2F%2Fexample.test&url=https%3A%2F%2Fother.test',
+        'wenxi://download?url=javascript%3Aalert(1)',
+        'wenxi://delete?url=https%3A%2F%2Fexample.test',
+        'wenxi://download/subpath?url=https%3A%2F%2Fexample.test',
+        'wenxi://download?name=missing.apk',
+      ]) {
+        expect(request({'launchUri': value}).kind, ExternalOpenKind.error);
+      }
+    },
+  );
+
   test(
     'signed URLs and caller headers reach the player without cloud credentials',
     () async {

@@ -76,13 +76,14 @@ class _InterruptedRecoveryManager extends DownloadManager {
     required super.refreshSource,
     super.foreground,
   });
-  int resumed = 0;
   @override
-  Future<void> resume(String id) async {
-    if (resumed++ == 1) {
-      throw const AppException('simulated recovery interruption');
-    }
-    await super.resume(id);
+  Future<DownloadBatchResult> batch(
+    Iterable<String> ids,
+    DownloadBatchAction action, {
+    bool deleteFiles = false,
+  }) async {
+    await super.batch(ids, action, deleteFiles: deleteFiles);
+    throw const AppException('simulated interruption after recovery commit');
   }
 }
 
@@ -298,7 +299,7 @@ void main() {
   );
 
   test(
-    'a second process loss midway through recovery retains the remaining queue',
+    'a second process loss after atomic recovery retains the entire queue',
     () async {
       manager.dispose();
       manager = create(interruptRecovery: true);
@@ -316,7 +317,15 @@ void main() {
         manager.recoverInterrupted(),
         throwsA(isA<AppException>()),
       );
-      expect(store.data['downloadRecovery'], ['recover-1', 'recover-2']);
+      expect(store.data['downloadRecovery'], isEmpty);
+      expect(
+        store.data
+            .list('tasks')
+            .every(
+              (task) => {'pending', 'running'}.contains(task.str('status')),
+            ),
+        isTrue,
+      );
       final crashSnapshot = StateStore.memory(store.data);
       await manager.close();
       manager.dispose();

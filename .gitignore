@@ -1,6 +1,9 @@
 # Miscellaneous
 *.class
 *.log
+*.har
+*.pcap
+*.pcapng
 *.pyc
 *.swp
 .DS_Store
@@ -59,6 +62,12 @@ app.*.map.json
 *.keystore
 *.p12
 *.pfx
+*.apk
+*.aab
+*.exe
+*.msi
+*.msix
+*.msixbundle
 keystore.properties
 native/bin/
 native/.tools/
@@ -74,8 +83,20 @@ native/.tools/
 /演示截图/
 /tool/demo/
 /LanzouAPI-master.zip
+/*.zip
 /control.json
 /config.fixed.json
+/config-[0-9]*.json
+/announcements.json
+/公告编辑器.html
+/tool/announcement-editor.test.cjs
+/交互.txt
+# Local implementation notes and diagnostics; keep application docs public.
+/docs/CLOUD-PROVIDERS-2026-09-24.md
+/docs/OPENLIST-CLOUDS-SMS-2026-09-24.md
+/docs/QUARK-AUTHENTICATED-DIRECT-DOWNLOAD.md
+/native/gopeed/internal/protocol/http/build.data
+/native/gopeed/internal/protocol/http/download.data
 /docs/*.json
 !/docs/kotlin-baseline-sha256.json
 /android/app/libs/*.aar

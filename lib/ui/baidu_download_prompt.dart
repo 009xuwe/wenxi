@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import '../app_services.dart';
 import '../domain/models.dart';
+import '../domain/baidu_share_route.dart';
 import 'common.dart';
 
 /// Confirm at the user's download action, before collecting or preparing files.
@@ -8,10 +9,12 @@ import 'common.dart';
 Future<bool> confirmBaiduDownload(
   BuildContext context,
   AppServices services,
-  CloudPlatform? platform,
-) async {
+  CloudPlatform? platform, {
+  BrowseSession? session,
+}) async {
   if (!context.mounted) return false;
   if (platform != CloudPlatform.baidu ||
+      session != null && BaiduShareRoute.usesPublicParser(session) ||
       services.settings.hideBaiduDownloadNotice) {
     return true;
   }

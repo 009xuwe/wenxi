@@ -101,6 +101,7 @@ type Fetcher struct {
 	activeConnections atomic.Int32
 	totalConnections  atomic.Int32
 	readable          readableBytes
+	aliyun            atomic.Pointer[aliyunTask]
 }
 
 func (f *Fetcher) Setup(ctl *controller.Controller) {
@@ -293,9 +294,10 @@ func (f *Fetcher) Start() (err error) {
 	if f.connections == nil {
 		f.connections = f.splitConnection()
 	}
+	f.expandPublicConnections()
 	f.initializeReadable()
 	f.totalConnections.Store(int32(len(f.connections)))
-	if limit := fhttp.BaiduConnectionLimit(f.meta.Opts.Extra.(*fhttp.OptsExtra).ConnectionProfile); limit > 0 {
+	if limit := connectionLimit(f.meta.Opts.Extra.(*fhttp.OptsExtra)); limit > 0 {
 		f.totalConnections.Store(int32(min(len(f.connections), limit)))
 	}
 	if limit := f.meta.Opts.Extra.(*fhttp.OptsExtra).SpeedLimit; limit > 0 {
@@ -304,6 +306,11 @@ func (f *Fetcher) Start() (err error) {
 		f.rate = nil
 	}
 	f.redirectURL = ""
+	if extra := f.meta.Opts.Extra.(*fhttp.OptsExtra); extra.ConnectionProfile == "aliyun" {
+		f.PrepareAliyunTransfer(extra.AliyunGroup, extra.Connections)
+	} else {
+		f.aliyun.Store(nil)
+	}
 	f.fetch()
 	return
 }
@@ -379,7 +386,7 @@ func (f *Fetcher) fetch() {
 	group, file, stopped := f.eg, f.file, f.stopped
 	connectionErrs := make([]error, len(f.connections))
 	var connectionSlots chan struct{}
-	if limit := fhttp.BaiduConnectionLimit(f.meta.Opts.Extra.(*fhttp.OptsExtra).ConnectionProfile); limit > 0 {
+	if limit := connectionLimit(f.meta.Opts.Extra.(*fhttp.OptsExtra)); limit > 0 {
 		// Old checkpoints can contain multiple partially downloaded ranges.
 		// Preserve their bytes while respecting the current route's limit.
 		connectionSlots = make(chan struct{}, limit)
@@ -458,7 +465,7 @@ func (f *Fetcher) run(index int, ctx context.Context) (err error) {
 			if f.meta.Res.Range && connection.remaining() <= 0 {
 				return nil
 			}
-			err = func() error {
+			err = func() (requestErr error) {
 				host := ""
 				if uri, parseErr := url.Parse(f.meta.Req.URL); parseErr == nil {
 					host = uri.Host
@@ -466,7 +473,21 @@ func (f *Fetcher) run(index int, ctx context.Context) (err error) {
 				if err := waitForHost(ctx, host); err != nil {
 					return err
 				}
-				release, err := acquireProfileConnection(ctx, host, profile)
+				var lease *aliyunLease
+				if policy := f.aliyun.Load(); profile == "aliyun" && policy != nil {
+					lease, err = policy.acquire(ctx)
+					if err != nil {
+						return err
+					}
+					defer lease.release()
+					defer func() { lease.failed(requestErr, retryDelay(attempts), time.Now()) }()
+				}
+				// Aliyun's account scheduler owns its limit across all CDN hosts.
+				budgetProfile := profile
+				if lease != nil {
+					budgetProfile = ""
+				}
+				release, err := acquireProfileConnection(ctx, host, budgetProfile)
 				if err != nil {
 					return err
 				}
@@ -512,6 +533,9 @@ func (f *Fetcher) run(index int, ctx context.Context) (err error) {
 						if profile == "baidu_preview" && last-first >= baiduPreviewRequestSize {
 							last = first + baiduPreviewRequestSize - 1
 						}
+						if profile == "aliyun" {
+							last = aliyunRangeEnd(first, last)
+						}
 						requestRemaining = last - first + 1
 						httpReq.Header.Set(base.HttpHeaderRange,
 							fmt.Sprintf(base.HttpHeaderRangeFormat, first, last))
@@ -527,6 +551,9 @@ func (f *Fetcher) run(index int, ctx context.Context) (err error) {
 					}
 					// Count only requests that have left the slot/cooldown/redirect
 					// queues, through connection setup, headers and body transfer.
+					if lease != nil {
+						lease.begin()
+					}
 					f.activeConnections.Add(1)
 					counted = true
 					resp, err = client.Do(httpReq)
@@ -542,7 +569,7 @@ func (f *Fetcher) run(index int, ctx context.Context) (err error) {
 				defer resp.Body.Close()
 				if resp.StatusCode != base.HttpCodeOK && resp.StatusCode != base.HttpCodePartialContent {
 					failure := responseError(resp)
-					if failure.Code == 429 || failure.Code == 503 {
+					if profile != "aliyun" && (failure.Code == 429 || failure.Code == 503) {
 						if profile == "xunlei" {
 							limitXunleiHost(host)
 						}
@@ -576,6 +603,9 @@ func (f *Fetcher) run(index int, ctx context.Context) (err error) {
 						finished, err := f.writeChunk(connection, buf[:n])
 						if err != nil {
 							return err
+						}
+						if lease != nil {
+							lease.progress(int64(n), time.Now())
 						}
 
 						if finished {
@@ -613,6 +643,9 @@ func (f *Fetcher) run(index int, ctx context.Context) (err error) {
 				// Space retries out so a transient 503 or interrupted transfer does
 				// not immediately hit the same overloaded endpoint again.
 				connection.setRetryState(true, attempts)
+				if policy := f.aliyun.Load(); profile == "aliyun" && policy != nil {
+					policy.retryWait(time.Now().Add(delay + time.Duration(index%17)*17*time.Millisecond))
+				}
 				select {
 				case <-ctx.Done():
 					return ctx.Err()

@@ -10,21 +10,17 @@ import '../data/remote_control_service.dart';
 import '../domain/models.dart';
 import '../domain/file_types.dart';
 import 'operation_progress_view.dart';
+import 'app_theme.dart';
 export '../domain/file_types.dart';
+export 'app_theme.dart' show themeAccent, themeCompanion, themeOnAccent;
+export 'app_background.dart' show backgroundSurface, BackgroundReadable;
 
-const brandBlue = Color(0xff007aff), brandPurple = Color(0xff5856d6);
 Color secondary(BuildContext context) =>
-    Theme.of(context).brightness == Brightness.dark
-    ? const Color(0xffaeaeb2)
-    : const Color(0xff8e8e93);
+    Theme.of(context).colorScheme.onSurfaceVariant;
 Color fill(BuildContext context) =>
-    Theme.of(context).brightness == Brightness.dark
-    ? const Color(0xff2c2c2e)
-    : const Color(0xfff2f2f7);
+    Theme.of(context).colorScheme.surfaceContainerLow;
 Color border(BuildContext context) =>
-    Theme.of(context).brightness == Brightness.dark
-    ? const Color(0xff38383a)
-    : const Color(0xffe5e5e7);
+    Theme.of(context).colorScheme.outlineVariant;
 
 String formatBytes(num bytes) {
   if (bytes <= 0) return '0 B';
@@ -55,9 +51,7 @@ void message(BuildContext context, String text, {VoidCallback? onTap}) {
   if (messenger == null) return;
   final theme = Theme.of(context);
   final wide = MediaQuery.sizeOf(context).width >= 640;
-  final accent = theme.brightness == Brightness.dark
-      ? const Color(0xff64b5ff)
-      : brandBlue;
+  final accent = theme.colorScheme.primary;
   messenger.clearSnackBars();
   messenger.showSnackBar(
     SnackBar(
@@ -312,7 +306,7 @@ class PlatformMark extends StatelessWidget {
   Widget build(BuildContext context) {
     final name = icon ?? platform?.icon;
     if (name == null) {
-      return Icon(CupertinoIcons.link, size: size, color: brandBlue);
+      return Icon(CupertinoIcons.link, size: size, color: themeAccent(context));
     }
     return ClipRRect(
       borderRadius: BorderRadius.circular(size * .2),
@@ -343,7 +337,7 @@ class FileGlyph extends StatelessWidget {
       FileKind.folder => (CupertinoIcons.folder_fill, const Color(0xffffbe3d)),
       FileKind.android => (Icons.android, const Color(0xff3ddc84)),
       FileKind.image => (CupertinoIcons.photo, const Color(0xffaf52de)),
-      FileKind.video => (CupertinoIcons.play_rectangle, brandBlue),
+      FileKind.video => (CupertinoIcons.play_rectangle, themeAccent(context)),
       FileKind.audio => (CupertinoIcons.music_note_2, const Color(0xfff06c96)),
       FileKind.archive => (CupertinoIcons.archivebox, const Color(0xffc29756)),
       FileKind.pdf => (CupertinoIcons.doc_richtext, const Color(0xffff5a55)),

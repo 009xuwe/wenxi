@@ -7,6 +7,11 @@ import 'package:asterlink/data/http.dart';
 import 'package:asterlink/platform/native_engine.dart';
 import 'package:asterlink/platform/file_access.dart';
 
+String gopeedTestExecutable() => p.absolute(
+  Platform.environment['ASTERLINK_GOPEED_TEST_EXE'] ??
+      'native/bin/asterlink_gopeed.exe',
+);
+
 class RecordedRequest {
   RecordedRequest(this.method, this.url, this.body, this.headers);
   final String method, url;
@@ -43,6 +48,7 @@ class FakeNative extends NativeTransport {
   bool started = false, writer = false, removedWhileWriting = false;
   bool finish = true;
   String? cache;
+  final taskCaches = <String, String>{};
   final calls = <String>[], begins = <Json>[];
   final content = <int>[1, 2, 3, 4];
   int openCount = 0;
@@ -52,6 +58,8 @@ class FakeNative extends NativeTransport {
   Future<Object?> call(String method, [Json args = const {}]) async {
     calls.add(method);
     switch (method) {
+      case 'version':
+        return {'taskCacheRoots': true};
       case 'open':
         started = true;
         openCount++;
@@ -59,7 +67,10 @@ class FakeNative extends NativeTransport {
       case 'begin':
         begins.add(args);
         writer = true;
-        final file = File(p.join(cache!, args.str('id'), 'payload.gopeed'));
+        taskCaches[args.str('id')] = args.str('cacheRoot', cache!);
+        final file = File(
+          p.join(taskCaches[args.str('id')]!, args.str('id'), 'payload.gopeed'),
+        );
         await file.parent.create(recursive: true);
         await file.writeAsBytes(content);
       case 'snapshot':
@@ -69,7 +80,11 @@ class FakeNative extends NativeTransport {
           'total': content.length,
           'downloaded': finish ? content.length : 0,
           'speed': 0,
-          'path': p.join(cache!, args.str('id'), 'payload.gopeed'),
+          'path': p.join(
+            taskCaches[args.str('id')] ?? cache!,
+            args.str('id'),
+            'payload.gopeed',
+          ),
         };
       case 'pause':
         await Future<void>.delayed(const Duration(milliseconds: 10));

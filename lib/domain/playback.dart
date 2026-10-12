@@ -9,6 +9,40 @@ enum PlaybackFit { contain, cover, stretch }
 
 enum PlaybackOrientation { system, portrait, landscape }
 
+enum PlaybackPlaylistOrder { source, ascending, descending }
+
+const playbackFolderFields = {
+  'rate',
+  'skipIntroSeconds',
+  'skipOutroSeconds',
+  'subtitles',
+  'subtitleSize',
+  'subtitleBottom',
+  'subtitleBackground',
+  'subtitleBackgroundColor',
+  'subtitleBackgroundOpacity',
+  'fit',
+  'aspectRatio',
+};
+
+const playbackAspectRatios = <String, double>{
+  '原始比例': 0,
+  '16:9': 16 / 9,
+  '4:3': 4 / 3,
+  '21:9': 21 / 9,
+  '1:1': 1,
+  '9:16': 9 / 16,
+};
+
+String playbackAspectLabel(double ratio) {
+  for (final entry in playbackAspectRatios.entries) {
+    if ((entry.value - ratio).abs() < .00001) return entry.key;
+  }
+  return '${ratio.toStringAsFixed(2)}:1';
+}
+
+enum SubtitleBackground { none, black, custom }
+
 /// Display dimensions include pixel aspect ratio and rotation, exactly once.
 class VideoGeometry {
   const VideoGeometry(this.width, this.height);
@@ -88,7 +122,11 @@ class PlaybackPreferences {
     this.subtitles = true,
     this.subtitleSize = 22,
     this.subtitleBottom = .04,
+    this.subtitleBackground = SubtitleBackground.none,
+    this.subtitleBackgroundColor = 0x202020,
+    this.subtitleBackgroundOpacity = .5,
     this.fit = PlaybackFit.contain,
+    this.aspectRatio = 0,
     this.connections = 8,
     this.driveConnections = const {},
     this.segmentSizeMiB = 3,
@@ -97,8 +135,19 @@ class PlaybackPreferences {
     this.skipOutroSeconds = 0,
   });
   final double rate, volume, subtitleSize, subtitleBottom;
+  final SubtitleBackground subtitleBackground;
+  final int subtitleBackgroundColor;
+  final double subtitleBackgroundOpacity;
+  int? get subtitleBackgroundArgb =>
+      subtitleBackground == SubtitleBackground.none
+      ? null
+      : ((subtitleBackgroundOpacity * 255).round() << 24) |
+            (subtitleBackground == SubtitleBackground.black
+                ? 0
+                : subtitleBackgroundColor);
   final bool autoNext, autoRotate, resume, subtitles, hardwareAcceleration;
   final PlaybackFit fit;
+  final double aspectRatio;
   final int connections;
   final Map<String, int> driveConnections;
   final int segmentSizeMiB, skipIntroSeconds, skipOutroSeconds;
@@ -136,6 +185,19 @@ class PlaybackPreferences {
       .4,
     ),
     autoNext: value.boolean('autoNext', true),
+    subtitleBackground: SubtitleBackground.values.firstWhere(
+      (mode) => mode.name == value.str('subtitleBackground'),
+      orElse: () => SubtitleBackground.none,
+    ),
+    subtitleBackgroundColor: value
+        .integer('subtitleBackgroundColor', 0x202020)
+        .clamp(0, 0xffffff),
+    subtitleBackgroundOpacity: finiteRange(
+      value.number('subtitleBackgroundOpacity', .5),
+      .5,
+      0,
+      1,
+    ),
     autoRotate: value.boolean('autoRotate', true),
     resume: value.boolean('resume', true),
     subtitles: value.boolean('subtitles', true),
@@ -143,6 +205,12 @@ class PlaybackPreferences {
       (fit) => fit.name == value.str('fit'),
       orElse: () => PlaybackFit.contain,
     ),
+    aspectRatio:
+        value.number('aspectRatio').isFinite &&
+            value.number('aspectRatio') >= .1 &&
+            value.number('aspectRatio') <= 10
+        ? value.number('aspectRatio')
+        : 0,
   );
   Json toJson() => {
     'rate': rate,
@@ -153,7 +221,11 @@ class PlaybackPreferences {
     'subtitles': subtitles,
     'subtitleSize': subtitleSize,
     'subtitleBottom': subtitleBottom,
+    'subtitleBackground': subtitleBackground.name,
+    'subtitleBackgroundColor': subtitleBackgroundColor,
+    'subtitleBackgroundOpacity': subtitleBackgroundOpacity,
     'fit': fit.name,
+    'aspectRatio': aspectRatio,
     'connections': connections,
     'driveConnections': driveConnections,
     'segmentSizeMiB': segmentSizeMiB,
@@ -166,11 +238,15 @@ class PlaybackPreferences {
     double? volume,
     double? subtitleSize,
     double? subtitleBottom,
+    SubtitleBackground? subtitleBackground,
+    int? subtitleBackgroundColor,
+    double? subtitleBackgroundOpacity,
     bool? autoNext,
     bool? autoRotate,
     bool? resume,
     bool? subtitles,
     PlaybackFit? fit,
+    double? aspectRatio,
     int? connections,
     Map<String, int>? driveConnections,
     int? segmentSizeMiB,
@@ -183,11 +259,17 @@ class PlaybackPreferences {
     'volume': volume ?? this.volume,
     'subtitleSize': subtitleSize ?? this.subtitleSize,
     'subtitleBottom': subtitleBottom ?? this.subtitleBottom,
+    'subtitleBackground': (subtitleBackground ?? this.subtitleBackground).name,
+    'subtitleBackgroundColor':
+        subtitleBackgroundColor ?? this.subtitleBackgroundColor,
+    'subtitleBackgroundOpacity':
+        subtitleBackgroundOpacity ?? this.subtitleBackgroundOpacity,
     'autoNext': autoNext ?? this.autoNext,
     'autoRotate': autoRotate ?? this.autoRotate,
     'resume': resume ?? this.resume,
     'subtitles': subtitles ?? this.subtitles,
     'fit': (fit ?? this.fit).name,
+    'aspectRatio': aspectRatio ?? this.aspectRatio,
     'connections': connections ?? this.connections,
     'driveConnections': driveConnections ?? this.driveConnections,
     'segmentSizeMiB': segmentSizeMiB ?? this.segmentSizeMiB,
@@ -251,11 +333,13 @@ class PlaybackEntry {
     this.platform,
     this.torrent = false,
     this.source,
+    this.settingsFolder,
   });
   final String id, key, name;
   final bool video, torrent;
   final CloudPlatform? platform;
   final PlaybackSource? source;
+  final String? settingsFolder;
 }
 
 class PlaybackRecord {

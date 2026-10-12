@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'subtitle_appearance.dart';
 import 'dart:io';
 import 'dart:math' as math;
 import 'package:file_selector/file_selector.dart';
@@ -14,11 +15,17 @@ import '../domain/auth.dart';
 import '../domain/playback.dart';
 import '../domain/playback_source.dart';
 import '../platform/playback_device.dart';
+import '../platform/player_screenshot.dart';
 import '../playback/playback_controller.dart';
+import '../playback/playback_sleep_timer.dart';
 import '../playback/subtitle_files.dart';
 import '../diagnostics/app_log.dart';
 import 'player_theme.dart';
 import 'player_rate_input.dart';
+import 'player_playlist_panel.dart';
+import 'player_aspect_panel.dart';
+import 'player_sleep_panel.dart';
+import 'player_screenshot_panel.dart';
 import 'pip_resize_handles.dart';
 import 'loading_indicator.dart';
 
@@ -32,6 +39,7 @@ class PlayerPage extends StatefulWidget {
     this.confirmDownload,
     this.chooseSubtitle,
     this.onAuthorizeUcTv,
+    this.screenshotActions = const PlayerScreenshotActions(),
   });
   final PlaybackController controller;
   final Directory subtitleDirectory;
@@ -40,6 +48,7 @@ class PlayerPage extends StatefulWidget {
   final Future<bool> Function()? confirmDownload;
   final Future<XFile?> Function()? chooseSubtitle;
   final Future<bool> Function()? onAuthorizeUcTv;
+  final PlayerScreenshotActions screenshotActions;
   @override
   State<PlayerPage> createState() => _PlayerPageState();
 }
@@ -79,6 +88,7 @@ class _PlayerPageState extends State<PlayerPage>
       _leaving = false,
       _pipBusy = false;
   bool _authorizing = false;
+  bool _screenshotBusy = false;
   int _authorizationGeneration = -1;
   bool get _needsUcTv =>
       controller.sourceError is UcTvAuthorizationRequired &&
@@ -221,6 +231,7 @@ class _PlayerPageState extends State<PlayerPage>
   void _syncNativeSubtitles() {
     final backend = controller.backend;
     if (!mounted ||
+        _screenshotBusy ||
         backend == null ||
         !backend.rendersSubtitlesNatively ||
         _nativeSubtitleHeight <= 0 ||
@@ -229,12 +240,17 @@ class _PlayerPageState extends State<PlayerPage>
     }
     _nativeSubtitleTimer = Timer(const Duration(milliseconds: 32), () {
       _nativeSubtitleTimer = null;
-      if (!mounted || !identical(backend, controller.backend)) return;
+      if (!mounted ||
+          _screenshotBusy ||
+          !identical(backend, controller.backend)) {
+        return;
+      }
       unawaited(
         backend
             .setSubtitlePresentation(
               size: _nativeSubtitleSize,
               height: _nativeSubtitleHeight,
+              backgroundColor: controller.preferences.subtitleBackgroundArgb,
               bottom:
                   ((_nativeSubtitleBottom +
                               _nativeSubtitleLift * _chrome.value) /
@@ -813,11 +829,15 @@ class _PlayerPageState extends State<PlayerPage>
 
   Future<void> _panel(
     String title,
-    Widget Function(BuildContext) content,
-  ) async {
+    Widget Function(BuildContext) content, {
+    bool previewSubtitles = false,
+  }) async {
     if (_activePanel != null || device.inPip) return;
     _modalDepth++;
     _hideTimer?.cancel();
+    // Show the selected subtitle position while the side panel is open, rather
+    // than lifting every low position above the playback controls.
+    if (previewSubtitles) _setControlsVisible(false);
     final theme = playerTheme(Theme.of(context));
     final route = RawDialogRoute<void>(
       settings: const RouteSettings(name: 'player-panel'),
@@ -954,10 +974,10 @@ class _PlayerPageState extends State<PlayerPage>
     title: Text(title),
     subtitle: subtitle == null ? null : Text(subtitle),
     selected: selected,
-    selectedColor: playerAccent,
-    selectedTileColor: playerAccent.withValues(alpha: .08),
+    selectedColor: playerAccent(context),
+    selectedTileColor: playerAccent(context).withValues(alpha: .08),
     trailing: selected
-        ? const Icon(CupertinoIcons.check_mark, color: playerAccent)
+        ? Icon(CupertinoIcons.check_mark, color: playerAccent(context))
         : null,
     onTap: action,
   );
@@ -1001,14 +1021,14 @@ class _PlayerPageState extends State<PlayerPage>
                         key: ValueKey('player-rate-$rate'),
                         style: OutlinedButton.styleFrom(
                           foregroundColor: controller.preferences.rate == rate
-                              ? playerAccent
+                              ? playerAccent(context)
                               : Colors.white,
                           backgroundColor: controller.preferences.rate == rate
-                              ? playerAccent.withValues(alpha: .12)
+                              ? playerAccent(context).withValues(alpha: .12)
                               : Colors.white.withValues(alpha: .04),
                           side: BorderSide(
                             color: controller.preferences.rate == rate
-                                ? playerAccent
+                                ? playerAccent(context)
                                 : Colors.white12,
                           ),
                           shape: RoundedRectangleBorder(
@@ -1200,6 +1220,7 @@ class _PlayerPageState extends State<PlayerPage>
                 '字幕位置  距底部 ${(controller.preferences.subtitleBottom * 100).round()}%',
               ),
               Slider(
+                key: const Key('player-subtitle-position'),
                 value: controller.preferences.subtitleBottom,
                 min: 0,
                 max: .4,
@@ -1214,19 +1235,25 @@ class _PlayerPageState extends State<PlayerPage>
                   () => controller.updatePreferences(controller.preferences),
                 ),
               ),
+              SubtitleAppearanceSettings(
+                preferences: controller.preferences,
+                onChanged: (value, save) =>
+                    _run(() => controller.updatePreferences(value, save: save)),
+              ),
             ],
           ),
         ),
       ],
     );
-  });
+  }, previewSubtitles: true);
   Future<void> _importSubtitle() async {
     if (_subtitleBusy) return;
     _subtitleBusy = true;
     _modalDepth++;
     _hideTimer?.cancel();
     final generation = controller.generation,
-        wasPlaying = controller.state.playing;
+        wasPlaying = controller.state.playing,
+        stopRevision = controller.sleepTimer.stopRevision;
     File? pending;
     try {
       final file =
@@ -1256,7 +1283,8 @@ class _PlayerPageState extends State<PlayerPage>
       _subtitleBusy = false;
       _modalDepth--;
       if (mounted) {
-        if (wasPlaying && generation == controller.generation) {
+        if (wasPlaying &&
+            controller.canResumeAfterPanel(generation, stopRevision)) {
           await controller.play();
         }
         _touch();
@@ -1265,53 +1293,85 @@ class _PlayerPageState extends State<PlayerPage>
   }
 
   Future<void> _playlist() => _panel(
-    '选集 · ${controller.index + 1}/${controller.entries.length}',
-    (context) => ListView.builder(
-      shrinkWrap: true,
-      itemCount: controller.entries.length,
-      itemBuilder: (_, index) => _choice(
-        controller.entries[index].name,
-        null,
-        index == controller.index,
-        () {
-          Navigator.pop(context);
-          _run(() => controller.load(index));
-        },
-        key: ValueKey('episode-$index'),
-      ),
+    '选集',
+    (context) => PlayerPlaylistPanel(
+      controller: controller,
+      onOrder: (order) => _run(() => controller.setPlaylistOrder(order)),
+      onSelect: (index) {
+        Navigator.pop(context);
+        _run(() => controller.load(index));
+      },
     ),
   );
   Future<void> _fit() => _panel(
     '画面比例',
-    (context) => ListView(
-      shrinkWrap: true,
-      children: [
-        for (final fit in PlaybackFit.values)
-          _choice(
-            _fitLabel(fit),
-            switch (fit) {
-              PlaybackFit.contain => '保留完整画面和原始比例',
-              PlaybackFit.cover => '铺满画面，可能裁切边缘',
-              PlaybackFit.stretch => '拉伸铺满，不保持原始比例',
-            },
-            controller.preferences.fit == fit,
-            () {
-              _run(
-                () => controller.updatePreferences(
-                  controller.preferences.copyWith(fit: fit),
-                ),
-              );
-              Navigator.pop(context);
-            },
-          ),
-      ],
+    (context) => PlayerAspectPanel(
+      preferences: controller.preferences,
+      onChanged: (value) => _run(() => controller.updatePreferences(value)),
     ),
+    previewSubtitles: true,
   );
-  String _fitLabel(PlaybackFit fit) => switch (fit) {
-    PlaybackFit.contain => '适应画面',
-    PlaybackFit.cover => '填充画面',
-    PlaybackFit.stretch => '拉伸画面',
-  };
+
+  Future<void> _sleep() =>
+      _panel('定时停止', (_) => PlayerSleepPanel(timer: controller.sleepTimer));
+
+  Future<void> _screenshot() async {
+    if (_screenshotBusy || !controller.ready || _activePanel != null) return;
+    _screenshotBusy = true;
+    _nativeSubtitleTimer?.cancel();
+    _nativeSubtitleTimer = null;
+    final generation = controller.generation,
+        stopRevision = controller.sleepTimer.stopRevision;
+    final wasPlaying = controller.state.playing;
+    final name = playerScreenshotName(
+      controller.current.name,
+      controller.state.position,
+      DateTime.now(),
+    );
+    try {
+      await controller.pause();
+      if (!mounted || generation != controller.generation) return;
+      await _panel(
+        '视频截图',
+        (_) => PlayerScreenshotPanel(
+          actions: widget.screenshotActions,
+          name: name,
+          subtitlesAvailable:
+              controller.preferences.subtitles &&
+              controller.backend?.rendersSubtitlesNatively == true,
+          capture: (include) async {
+            require(generation == controller.generation, '视频已切换，请重新截图');
+            if (include && _nativeSubtitleHeight > 0) {
+              await controller.backend?.setSubtitlePresentation(
+                size: _nativeSubtitleSize,
+                height: _nativeSubtitleHeight,
+                bottom: (_nativeSubtitleBottom / _nativeSubtitleHeight).clamp(
+                  0,
+                  .6,
+                ),
+                backgroundColor: controller.preferences.subtitleBackgroundArgb,
+              );
+            }
+            return controller.screenshot(includeSubtitles: include);
+          },
+        ),
+        previewSubtitles: true,
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _screenshotBusy = false);
+      } else {
+        _screenshotBusy = false;
+      }
+      if (mounted &&
+          wasPlaying &&
+          controller.canResumeAfterPanel(generation, stopRevision)) {
+        await controller.play();
+      }
+      if (mounted) _syncNativeSubtitles();
+    }
+  }
+
   Future<void> _settings() async {
     Future<void> Function()? next;
     await _panel(
@@ -1379,6 +1439,48 @@ class _PlayerPageState extends State<PlayerPage>
             ),
           ),
           const Divider(height: 1),
+          AnimatedBuilder(
+            animation: controller.sleepTimer,
+            builder: (context, _) => ListTile(
+              key: const Key('player-sleep'),
+              leading: const Icon(CupertinoIcons.moon_zzz),
+              title: const Text('定时停止'),
+              subtitle: Text(playerSleepLabel(controller.sleepTimer)),
+              trailing: const Icon(CupertinoIcons.chevron_right, size: 16),
+              onTap: () {
+                next = _sleep;
+                Navigator.pop(context);
+              },
+            ),
+          ),
+          if (controller.hasVideo)
+            ListTile(
+              key: const Key('player-screenshot-settings'),
+              leading: const Icon(CupertinoIcons.camera),
+              title: const Text('视频截图'),
+              subtitle: const Text('保存画面，可选择包含字幕'),
+              enabled:
+                  controller.ready &&
+                  controller.backend?.supportsScreenshot == true,
+              trailing: const Icon(CupertinoIcons.chevron_right, size: 16),
+              onTap: () {
+                next = _screenshot;
+                Navigator.pop(context);
+              },
+            ),
+          SwitchListTile(
+            key: const Key('player-folder-memory'),
+            title: const Text('记住此文件夹的设置'),
+            subtitle: Text(
+              controller.folderKey == null
+                  ? '当前来源无法确定文件夹，使用通用设置'
+                  : '分别保存倍速、片头片尾、字幕样式和画面比例',
+            ),
+            value: controller.remembersFolder,
+            onChanged: controller.folderKey == null || controller.loading
+                ? null
+                : (value) => _run(() => controller.setRememberFolder(value)),
+          ),
           if (controller.hasVideo && device.supportsExternalPlayer)
             ListTile(
               leading: const Icon(CupertinoIcons.arrow_up_right_square),
@@ -1429,7 +1531,7 @@ class _PlayerPageState extends State<PlayerPage>
           ),
           SwitchListTile(
             title: const Text('自动播放下一集'),
-            subtitle: const Text('按当前文件列表的顺序播放'),
+            subtitle: const Text('按选集面板中的顺序播放'),
             value: controller.preferences.autoNext,
             onChanged: (value) => _run(
               () => controller.updatePreferences(
@@ -1492,10 +1594,10 @@ class _PlayerPageState extends State<PlayerPage>
                           backgroundColor: const Color(0xff26272b),
                           surfaceTintColor: Colors.transparent,
                           side: const BorderSide(color: Colors.white24),
-                          checkmarkColor: playerAccent,
+                          checkmarkColor: playerAccent(context),
                           labelStyle: TextStyle(
                             color: controller.connections == count
-                                ? playerAccent
+                                ? playerAccent(context)
                                 : Colors.white70,
                           ),
                         ),
@@ -1874,7 +1976,7 @@ class _PlayerPageState extends State<PlayerPage>
                       : math.min(
                           box.maxHeight * .55,
                           math.max(
-                            24.0,
+                            0.0,
                             box.maxHeight *
                                     controller.preferences.subtitleBottom +
                                 insets.bottom,
@@ -1905,7 +2007,9 @@ class _PlayerPageState extends State<PlayerPage>
                             child: Video(
                               key: ObjectKey(backend),
                               aspectRatio:
-                                  controller.videoGeometry?.aspectRatio,
+                                  controller.preferences.aspectRatio > 0
+                                  ? controller.preferences.aspectRatio
+                                  : controller.videoGeometry?.aspectRatio,
                               controller: backend!.videoController!,
                               controls: NoVideoControls,
                               pauseUponEnteringBackgroundMode: false,
@@ -1975,28 +2079,15 @@ class _PlayerPageState extends State<PlayerPage>
                                 offset: Offset(0, -captionLift * _chrome.value),
                                 child: child,
                               ),
-                              child: Text(
-                                captions,
-                                key: const Key('player-captions'),
-                                textAlign: TextAlign.center,
-                                textScaler: TextScaler.noScaling,
-                                maxLines: 5,
-                                overflow: TextOverflow.fade,
-                                style: TextStyle(
-                                  color: Colors.white,
-                                  fontSize: pip
-                                      ? 12
-                                      : controller.preferences.subtitleSize,
-                                  height: 1.35,
-                                  shadows: const [
-                                    Shadow(color: Colors.black, blurRadius: 4),
-                                    Shadow(
-                                      color: Colors.black,
-                                      offset: Offset(1, 1),
-                                      blurRadius: 2,
-                                    ),
-                                  ],
-                                ),
+                              child: SubtitleCaption(
+                                text: captions,
+                                textKey: const Key('player-captions'),
+                                size: pip
+                                    ? 12
+                                    : controller.preferences.subtitleSize,
+                                backgroundColor: controller
+                                    .preferences
+                                    .subtitleBackgroundArgb,
                               ),
                             ),
                           ),
@@ -2098,6 +2189,8 @@ class _PlayerPageState extends State<PlayerPage>
                                                 _bottomControls(),
                                           ),
                                           _lockControl(false),
+                                          if (controller.hasVideo)
+                                            _screenshotControl(),
                                         ],
                                       ],
                                     ),
@@ -2184,6 +2277,32 @@ class _PlayerPageState extends State<PlayerPage>
     ),
   );
 
+  Widget _screenshotControl() => SafeArea(
+    top: false,
+    bottom: false,
+    child: Align(
+      alignment: Alignment.centerRight,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Material(
+          color: Colors.black54,
+          borderRadius: BorderRadius.circular(28),
+          child: _icon(
+            '视频截图',
+            CupertinoIcons.camera,
+            controller.ready &&
+                    controller.backend?.supportsScreenshot == true &&
+                    !_screenshotBusy
+                ? () => _run(_screenshot)
+                : null,
+            color: Colors.white,
+            key: const Key('player-screenshot'),
+          ),
+        ),
+      ),
+    ),
+  );
+
   Widget _topControls() => Align(
     alignment: Alignment.topCenter,
     child: Container(
@@ -2242,6 +2361,36 @@ class _PlayerPageState extends State<PlayerPage>
                   ),
                 _icon('播放设置', CupertinoIcons.ellipsis, () => _run(_settings)),
               ],
+            ),
+            AnimatedBuilder(
+              animation: controller.sleepTimer,
+              builder: (context, _) {
+                if (controller.sleepTimer.mode == PlaybackSleepMode.off) {
+                  return const SizedBox.shrink();
+                }
+                return Align(
+                  alignment: Alignment.centerLeft,
+                  child: Padding(
+                    padding: const EdgeInsets.only(left: 48),
+                    child: TextButton.icon(
+                      key: const Key('player-sleep-badge'),
+                      onPressed: () => _run(_sleep),
+                      icon: const Icon(CupertinoIcons.moon_zzz, size: 14),
+                      label: Text(
+                        playerSleepLabel(controller.sleepTimer),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontSize: 12),
+                      ),
+                      style: TextButton.styleFrom(
+                        foregroundColor: Colors.white70,
+                        minimumSize: const Size(0, 32),
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
+                    ),
+                  ),
+                );
+              },
             ),
             if (controller.resumedFrom > Duration.zero)
               Padding(
@@ -2326,7 +2475,7 @@ class _PlayerPageState extends State<PlayerPage>
                               .clamp(0, maximum)
                               .toDouble(),
                         ),
-                        activeColor: playerAccent,
+                        activeColor: playerAccent(context),
                         inactiveColor: Colors.white24,
                         secondaryActiveColor: Colors.white54,
                         thumbColor: Colors.white,

@@ -10,6 +10,10 @@ import 'native_engine.dart';
 
 enum ExternalOpenKind { share, download, play, error }
 
+const windowsExternalOpenChannel = MethodChannel(
+  'com.asterlink.app/external_open',
+);
+
 class ExternalOpenRequest {
   const ExternalOpenRequest._({
     required this.id,
@@ -27,7 +31,41 @@ class ExternalOpenRequest {
   final Map<String, String> headers;
 
   factory ExternalOpenRequest.fromPlatform(Object? raw) {
-    final value = asJson(raw);
+    var value = asJson(raw);
+    if (value.containsKey('launchUri')) {
+      try {
+        final launch = value.str('launchUri');
+        require(launch.length <= 16384, '外部下载地址过长');
+        final uri = Uri.parse(launch);
+        String target = launch, name = '';
+        if (uri.scheme == 'wenxi') {
+          require(
+            uri.host == 'download' &&
+                (uri.path.isEmpty || uri.path == '/') &&
+                uri.userInfo.isEmpty &&
+                !uri.hasPort &&
+                !uri.hasFragment &&
+                uri.queryParametersAll['url']?.length == 1 &&
+                (uri.queryParametersAll['name']?.length ?? 0) <= 1,
+            '外部下载调用格式无效',
+          );
+          target = uri.queryParameters['url']!;
+          name = uri.queryParameters['name'] ?? '';
+        }
+        value = {
+          'id': value.str('id'),
+          'kind': 'download',
+          'uri': target,
+          'name': name,
+        };
+      } on Object {
+        value = {
+          'id': value.str('id'),
+          'kind': 'error',
+          'message': '外部下载调用格式无效',
+        };
+      }
+    }
     final id = value.str('id');
     final kind = ExternalOpenKind.values
         .where((kind) => kind.name == value.str('kind'))

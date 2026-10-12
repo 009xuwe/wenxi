@@ -56,7 +56,11 @@ BrowseSession tokenPersonal(
   metadata: {
     if (platform == CloudPlatform.aliyun) 'driveId': drive,
     if (platform == CloudPlatform.aliyun)
-      'driveName': drive == 'backup' ? '备份盘' : '资源库',
+      'driveName': switch (drive) {
+        'backup' => '备份盘',
+        'album' => '相册',
+        _ => '资源库',
+      },
   },
 );
 
@@ -109,6 +113,11 @@ HttpResult aliDefaultResponse(RecordedRequest request) {
     case '/v2/databox/get_personal_info':
       return jsonResponse({
         'personal_space_info': {'used_size': 200, 'total_size': 1000},
+      });
+    case '/adrive/v1/user/albums_info':
+      return jsonResponse({
+        'code': 200,
+        'data': {'driveId': '', 'driveName': ''},
       });
     case '/users/v1/users/device/create_session':
       return jsonResponse({'result': true});

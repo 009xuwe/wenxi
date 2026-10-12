@@ -56,3 +56,13 @@ bounded refresh, cancellation, source leases and Range retries.
 
 Remove this extension when the upstream package exposes an equivalent terminal
 failure signal and the application has migrated with these regressions passing.
+
+## Screenshot argument allocation and cleanup
+
+Allocate `screenshot-raw` arguments as a null-terminated array of pointers.
+The upstream allocation used the total character count, which is insufficient
+for three pointers on 64-bit platforms when capturing without subtitles.
+Free the command result and arguments in `finally`, also when encoding fails.
+Validate dimensions, stride and buffer length before encoding; cap captures at
+16 megapixels to bound temporary image allocations. The real libmpv subtitle
+render tests exercise PNG captures with and without libass subtitles.

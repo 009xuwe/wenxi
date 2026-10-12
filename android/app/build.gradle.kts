@@ -66,6 +66,7 @@ flutter { source = "../.." }
 dependencies {
     implementation(files("libs/gopeed-1.8.1.aar"))
     implementation(libs.bundles.platform)
+    implementation(libs.zxing.embedded)
     testImplementation(libs.junit)
     testImplementation(libs.robolectric)
 }

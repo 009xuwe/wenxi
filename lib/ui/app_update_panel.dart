@@ -48,6 +48,16 @@ class _AppUpdatePanelState extends State<AppUpdatePanel> {
     }
   }
 
+  bool _matchesUpdate(AppUpdateService updater, RemoteUpdate update) =>
+      mounted &&
+      widget.updater == updater &&
+      updater.keyFor(widget.update) == updater.keyFor(update);
+
+  bool _canInstall(AppUpdateService updater, RemoteUpdate update) =>
+      _matchesUpdate(updater, update) &&
+      widget.control.inForeground &&
+      ModalRoute.of(context)?.isCurrent == true;
+
   void _changed() {
     if (!mounted) return;
     setState(() {});
@@ -61,26 +71,13 @@ class _AppUpdatePanelState extends State<AppUpdatePanel> {
     // Completion in the background or after dismissal leaves an install button.
     // Returning from the installer must never automatically open it again.
     _autoInstallKey = null;
-    if (updater.platform != 'android' ||
-        !widget.control.inForeground ||
-        ModalRoute.of(context)?.isCurrent != true) {
+    if (updater.platform != 'android' || !_canInstall(updater, update)) {
       return;
     }
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted &&
-          widget.updater == updater &&
-          updater.keyFor(widget.update) == updater.keyFor(update) &&
-          widget.control.inForeground &&
-          ModalRoute.of(context)?.isCurrent == true) {
+      if (_canInstall(updater, update)) {
         unawaited(
-          updater.install(
-            update,
-            canOpen: () =>
-                mounted &&
-                widget.updater == updater &&
-                updater.keyFor(widget.update) == updater.keyFor(update) &&
-                ModalRoute.of(context)?.isCurrent == true,
-          ),
+          updater.install(update, canOpen: () => _canInstall(updater, update)),
         );
       }
     });
@@ -90,9 +87,15 @@ class _AppUpdatePanelState extends State<AppUpdatePanel> {
     final updater = widget.updater, update = widget.update;
     _autoInstallKey = updater.keyFor(update);
     final started = await updater.start(update, redownload: redownload);
-    if (!mounted) return;
+    if (!_matchesUpdate(updater, update)) return;
     if (!started) _autoInstallKey = null;
     _changed();
+  }
+
+  Future<void> _install() async {
+    final updater = widget.updater, update = widget.update;
+    _autoInstallKey = null;
+    await updater.install(update, canOpen: () => _canInstall(updater, update));
   }
 
   @override
@@ -181,7 +184,7 @@ class _AppUpdatePanelState extends State<AppUpdatePanel> {
           onPressed: busy || active
               ? null
               : completed
-              ? () => updater.install(update)
+              ? _install
               : _start,
           icon: Icon(
             completed
@@ -206,8 +209,10 @@ class _AppUpdatePanelState extends State<AppUpdatePanel> {
                         },
                   child: const Text('暂停下载'),
                 ),
-              if (completed && error != null)
+              if (task.status == DownloadStatus.failed ||
+                  (completed && error != null))
                 TextButton(
+                  key: const ValueKey('control-update-redownload'),
                   onPressed: busy ? null : () => _start(redownload: true),
                   child: const Text('重新下载'),
                 ),

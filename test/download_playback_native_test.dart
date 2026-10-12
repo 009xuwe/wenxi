@@ -19,7 +19,7 @@ class _Io extends HttpOverrides {}
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
-  final executable = File('native/bin/asterlink_gopeed.exe').absolute.path;
+  final executable = gopeedTestExecutable();
   final library = File(
     'build/windows/x64/runner/Release/libmpv-2.dll',
   ).absolute.path;

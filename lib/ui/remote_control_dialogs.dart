@@ -157,9 +157,9 @@ Future<T?> _present<T>(
   }
 }
 
-Widget _dialogTitle(IconData icon, String title) => Row(
+Widget _dialogTitle(BuildContext context, IconData icon, String title) => Row(
   children: [
-    Icon(icon, size: 22, color: brandBlue),
+    Icon(icon, size: 22, color: themeAccent(context)),
     const SizedBox(width: 10),
     Expanded(
       child: Text(
@@ -213,7 +213,11 @@ Future<void> showRemoteAnnouncement(
             key: const ValueKey('control-announcement-dialog'),
             scrollable: true,
             constraints: const BoxConstraints(minWidth: 320, maxWidth: 520),
-            title: _dialogTitle(CupertinoIcons.bell, current?.title ?? '软件公告'),
+            title: _dialogTitle(
+              context,
+              CupertinoIcons.bell,
+              current?.title ?? '软件公告',
+            ),
             content: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -445,6 +449,7 @@ class _UpdateDialogState extends State<_UpdateDialog> {
           scrollable: true,
           constraints: const BoxConstraints(minWidth: 320, maxWidth: 520),
           title: _dialogTitle(
+            context,
             CupertinoIcons.arrow_down_circle,
             '${update.force ? '请更新至' : '发现新版本'} ${update.version}',
           ),

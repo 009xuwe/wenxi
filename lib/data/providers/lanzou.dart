@@ -328,14 +328,27 @@ class LanzouConnector extends CloudConnector {
       for (final row in rows) {
         require(row is Map, '蓝奏文件信息不完整，请刷新列表');
         final value = asJson(row);
-        final id = value.str('id');
-        require(RegExp(r'^i[A-Za-z0-9]+$').hasMatch(id), '蓝奏文件分享标识无效，请刷新列表');
+        // Folder entries may contain i...?... rather than a bare share ID.
+        // Keep webpage/signature parameters for the request, but use the path
+        // ID for deduplication and matching saved downloads after a refresh.
+        final reference = value.str('id');
+        final address = reference.length <= 8192
+            ? RegExp(
+                r'^(i[A-Za-z0-9]+)(?:\?[^\s\x00-\x1f\x7f#]*)?$',
+              ).firstMatch(reference)
+            : null;
+        require(
+          address != null &&
+              !RegExp(r'%(?![0-9a-fA-F]{2})').hasMatch(reference),
+          '蓝奏文件分享标识无效，请刷新列表',
+        );
+        final id = address![1]!;
         final file = CloudFile(
           id: id,
           name: _entryName(value.str('name_all', value.str('name'))),
           size: LanzouPage.sizeFromLabel(value.str('size')),
           parentId: parent,
-          token: '${pageUri.origin}/$id',
+          token: '${pageUri.origin}/$reference',
           modifiedAt: value.str('time'),
         );
         final existing = entries[id];

@@ -42,6 +42,7 @@ Future<void> openRecentPlayback(
             context,
             services,
             controller.current.platform,
+            session: controller.current.source?.cloud?.session,
           ),
           onAuthorizeUcTv: controller.current.platform == CloudPlatform.uc
               ? () => openUcTvAuthorization(
@@ -244,7 +245,7 @@ class _RecentPlaybackPageState extends State<RecentPlaybackPage>
                                 bookmark.duration.inMilliseconds)
                             .clamp(0, 1),
                     backgroundColor: fill(context),
-                    color: brandBlue,
+                    color: themeAccent(context),
                   ),
                 ),
               ],
@@ -341,10 +342,10 @@ class _RecentPlaybackSummaryState extends State<RecentPlaybackSummary> {
                       style: TextStyle(fontSize: 12, color: secondary(context)),
                     ),
                     const SizedBox(width: 4),
-                    const Icon(
+                    Icon(
                       CupertinoIcons.chevron_right,
                       size: 14,
-                      color: brandBlue,
+                      color: themeAccent(context),
                     ),
                   ],
                 ),
@@ -395,7 +396,7 @@ class _RecentPlaybackSummaryState extends State<RecentPlaybackSummary> {
                         record.source == null
                             ? CupertinoIcons.info_circle
                             : CupertinoIcons.play_circle_fill,
-                        color: brandBlue,
+                        color: themeAccent(context),
                         size: 32,
                       ),
                     ],

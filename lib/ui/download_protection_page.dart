@@ -83,7 +83,7 @@ class _DownloadProtectionPageState extends State<DownloadProtectionPage>
       children: [
         Row(
           children: [
-            Icon(icon, color: brandBlue, size: 22),
+            Icon(icon, color: themeAccent(context), size: 22),
             const SizedBox(width: 10),
             Expanded(
               child: Text(
@@ -143,15 +143,15 @@ class _DownloadProtectionPageState extends State<DownloadProtectionPage>
                 ),
               )
             else if (state.desktop) ...[
-              const Icon(
+              Icon(
                 CupertinoIcons.shield_lefthalf_fill,
-                color: brandBlue,
+                color: themeAccent(context),
                 size: 32,
               ),
               const SizedBox(height: 14),
               Text(
                 state.wakeLockHeld ? '下载保活运行中 · 自动休眠保护已开启' : '下载开始后自动启用保护',
-                style: const TextStyle(color: brandBlue),
+                style: TextStyle(color: themeAccent(context)),
               ),
               const SizedBox(height: 12),
               Text(
@@ -208,7 +208,7 @@ class _DownloadProtectionPageState extends State<DownloadProtectionPage>
                 state.keepAliveRunning
                     ? '后台保活运行中${state.keepAliveNotificationsEnabled ? '' : ' · 通知未开启'}'
                     : '后台保活未运行，重新打开应用后重试',
-                style: const TextStyle(color: brandBlue),
+                style: TextStyle(color: themeAccent(context)),
               ),
               const SizedBox(height: 8),
               Text(
@@ -217,7 +217,7 @@ class _DownloadProtectionPageState extends State<DownloadProtectionPage>
                     : state.serviceRunning
                     ? '下载保护运行中${state.wakeLockHeld ? ' · 锁屏保护已启用' : ''}'
                     : '下载开始后自动启用锁屏保护',
-                style: const TextStyle(color: brandBlue),
+                style: TextStyle(color: themeAccent(context)),
               ),
               if (state.powerSaveMode) ...[
                 const SizedBox(height: 8),

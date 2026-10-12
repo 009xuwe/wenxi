@@ -71,6 +71,8 @@ abstract class PlaybackBackend extends ChangeNotifier {
   String get streamingDescription => '';
   Map<String, Object?> get diagnosticFields => const {};
   bool get rendersSubtitlesNatively => false;
+  bool get supportsScreenshot => false;
+  Future<Uint8List?> screenshot({bool includeSubtitles = false}) async => null;
   String get subtitleFontMessage => '';
   bool get subtitleFontLoading => false;
   Future<void> retrySubtitleFont() async {}
@@ -80,6 +82,7 @@ abstract class PlaybackBackend extends ChangeNotifier {
     required double size,
     required double height,
     required double bottom,
+    int? backgroundColor,
   }) async {}
   Future<void> setConnections(int value) async {}
   Future<void> setSegmentSizeMiB(int value) async {}
@@ -237,7 +240,7 @@ class MediaKitBackend extends PlaybackBackend {
   PlaybackMetrics _metrics = PlaybackMetrics();
   PlaybackBufferPolicy _bufferPolicy = PlaybackBufferPolicy(connectionLimit: 8);
   final Map<String, Object?> _nativeMetrics = {};
-  (double, double, double)? _subtitlePresentation;
+  (double, double, double, int?)? _subtitlePresentation;
   Future<void>? _initializing;
   int? _initializedMs;
   Future<void>? _closeFuture;
@@ -398,6 +401,20 @@ class MediaKitBackend extends PlaybackBackend {
   }
 
   final _propertyGate = AsyncGate();
+  @override
+  bool get supportsScreenshot =>
+      !_closing && (state.width ?? 0) > 1 && (state.height ?? 0) > 1;
+
+  @override
+  Future<Uint8List?> screenshot({bool includeSubtitles = false}) =>
+      _propertyGate.run(() async {
+        if (!supportsScreenshot) return null;
+        final image = await player.screenshot(
+          format: 'image/png',
+          includeLibassSubtitles: includeSubtitles,
+        );
+        return _closing ? null : image;
+      });
   final Future<Uint8List?> Function(
     DownloadSpec source,
     int start,
@@ -738,16 +755,38 @@ class MediaKitBackend extends PlaybackBackend {
     required double size,
     required double height,
     required double bottom,
+    int? backgroundColor,
   }) => _propertyGate.run(() async {
     if (_closing || !rendersSubtitlesNatively || height <= 0) return;
-    final next = (size, height.roundToDouble(), (bottom * 100).roundToDouble());
+    final next = (
+      size,
+      height.roundToDouble(),
+      (bottom * 100).roundToDouble(),
+      backgroundColor,
+    );
     if (_subtitlePresentation == next) return;
     final native = player.platform;
     if (native is! NativePlayer) return;
     for (final entry in {
       'sub-font-size': (22 * 720 / height).clamp(8, 144).toStringAsFixed(2),
       'sub-scale': (size / 22).toStringAsFixed(3),
+      // The page already provides the bottom distance. libass's default 34
+      // scaled-pixel margin otherwise raises even the user's zero setting.
+      'sub-margin-y': '0',
       'sub-pos': (100 - next.$3).clamp(40, 100).toStringAsFixed(0),
+      // Keep a thin outline in viewport pixels instead of the core's thick
+      // default. With background-box, shadow-offset is symmetric box padding,
+      // not an offset copy of the text. ASS-authored styles remain intact.
+      'sub-border-size': (720 / height).clamp(.1, 12).toStringAsFixed(2),
+      'sub-border-color': '#CC000000',
+      'sub-border-style': backgroundColor == null
+          ? 'outline-and-shadow'
+          : 'background-box',
+      'sub-back-color':
+          '#${(backgroundColor ?? 0).toRadixString(16).padLeft(8, '0')}',
+      'sub-shadow-offset': backgroundColor == null
+          ? '0'
+          : (3 * 720 / height).clamp(.1, 24).toStringAsFixed(2),
     }.entries) {
       if (_closing) return;
       await native.setProperty(entry.key, entry.value);

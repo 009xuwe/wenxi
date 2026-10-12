@@ -40,6 +40,7 @@ class ExperimentalFeaturesPage extends StatelessWidget {
     required String guestSetting,
     required bool guestEnabled,
     bool? authenticatedEnabled,
+    bool guestDefaultOn = false,
   }) => Column(
     crossAxisAlignment: CrossAxisAlignment.stretch,
     children: [
@@ -63,7 +64,9 @@ class ExperimentalFeaturesPage extends StatelessWidget {
               context,
               setting: guestSetting,
               title: '游客下载',
-              description: '$guestDescription未登录对应网盘时自动使用；登录后开启此项才会优先尝试游客下载。',
+              description: guestDefaultOn
+                  ? '$guestDescription默认开启，已登录时也优先尝试游客下载，接口不可用时再使用账号下载。关闭后，已登录账号使用常规下载；未登录时仍自动尝试游客下载。'
+                  : '$guestDescription未登录对应网盘时自动使用；登录后开启此项才会优先尝试游客下载。',
               value: guestEnabled,
             ),
             if (authenticatedEnabled != null) ...[
@@ -117,6 +120,7 @@ class ExperimentalFeaturesPage extends StatelessWidget {
                 guestDescription: '无需登录，游客下载不限制文件大小。',
                 guestSetting: 'ucGuestDirectDownload',
                 guestEnabled: settings.ucGuestDirectDownload,
+                guestDefaultOn: true,
               ),
             ],
           );

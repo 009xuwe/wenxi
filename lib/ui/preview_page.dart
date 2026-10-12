@@ -23,11 +23,13 @@ class PreviewPage extends StatefulWidget {
     this.file, {
     super.key,
     this.playlist = const [],
+    this.parentFolders = const {},
   });
   final AppServices services;
   final BrowseSession session;
   final CloudFile file;
   final List<CloudFile> playlist;
+  final Map<String, String> parentFolders;
   @override
   State<PreviewPage> createState() => _PreviewPageState();
 }
@@ -54,6 +56,7 @@ class _PreviewPageState extends State<PreviewPage> {
         widget.session,
         widget.file,
         widget.playlist,
+        parentFolders: widget.parentFolders,
       );
     } else {
       _load();
@@ -117,6 +120,7 @@ class _PreviewPageState extends State<PreviewPage> {
             context,
             widget.services,
             widget.session.platform,
+            session: widget.session,
           ) ||
           !mounted) {
         return;
@@ -173,6 +177,7 @@ class _PreviewPageState extends State<PreviewPage> {
           context,
           widget.services,
           playback!.current.platform,
+          session: playback!.current.source?.cloud?.session,
         ),
         onAuthorizeUcTv: widget.session.platform == CloudPlatform.uc
             ? () => openUcTvAuthorization(

@@ -1,6 +1,7 @@
 {
   "controlEnabled": false,
   "controlUrl": "",
+  "announcementsUrl": "",
   "githubRepository": "",
   "applicationId": "com.asterlink.app.community",
   "metricsAppKey": "",

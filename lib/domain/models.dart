@@ -43,7 +43,13 @@ enum CloudPlatform {
     '545c.com',
     'pipipan.com',
   ]),
-  feijipan('Feijipan', '小飞机网盘', '小飞机', 'feijipan', ['feijipan.com']);
+  feijipan('Feijipan', '小飞机网盘', '小飞机', 'feijipan', ['feijipan.com']),
+  pikpak('PikPak', 'PikPak网盘', 'PikPak', 'pikpak', ['mypikpak.com']),
+  github('GitHub', 'GitHub', 'GitHub', 'github', [
+    'github.com',
+    'raw.githubusercontent.com',
+    'codeload.github.com',
+  ]);
 
   const CloudPlatform(
     this.key,
@@ -61,6 +67,7 @@ enum CloudPlatform {
   bool get supportsPersonalSpaces => this == aliyun || this == ctfile;
   bool get supportsShareParsing => this != ilanzou && this != weiyun;
   bool get shareRequiresAccount => !{
+    baidu,
     lanzou,
     guangya,
     aliyun,
@@ -69,9 +76,11 @@ enum CloudPlatform {
     uc,
     ctfile,
     feijipan,
+    pikpak,
+    github,
   }.contains(this);
   bool get supportsSharing =>
-      this != ilanzou && this != weiyun && this != wopan;
+      this != ilanzou && this != weiyun && this != wopan && this != github;
   String get shareUnavailableMessage => '$label暂不支持分享解析，请在网盘页登录后浏览个人文件';
   bool get exactFileSize =>
       this != ilanzou && this != lanzou && this != feijipan;
@@ -314,7 +323,9 @@ class BrowseSession {
   String get personalSpaceId =>
       mode == BrowseMode.personal ? meta('driveId') : '';
   bool get isFamily => mode == BrowseMode.personal && familyId.isNotEmpty;
-  bool get canManageFiles => mode == BrowseMode.personal && !isFamily;
+  bool get canManageFiles => platform == CloudPlatform.github
+      ? mode == BrowseMode.personal && meta('githubAuthenticated') == 'true'
+      : mode == BrowseMode.personal && !isFamily;
   Map<String, String> get spaceMetadata => {
     if (isFamily) 'familyId': familyId,
     if (isFamily) 'familyName': meta('familyName'),
@@ -430,6 +441,7 @@ class DownloadSpec {
     DownloadCleanup? cleanup,
     String? appUpdateKey,
     bool? guestDownload,
+    String? profile,
   }) => DownloadSpec(
     url: url,
     fileName: fileName ?? this.fileName,
@@ -440,7 +452,7 @@ class DownloadSpec {
     checksumValue: checksumValue,
     cleanup: cleanup ?? this.cleanup,
     source: source ?? this.source,
-    profile: profile,
+    profile: profile ?? this.profile,
     torrent: torrent,
     appUpdateKey: appUpdateKey ?? this.appUpdateKey,
     guestDownload: guestDownload ?? this.guestDownload,
@@ -481,6 +493,17 @@ class DownloadSpec {
 
 abstract class CloudConnector {
   CloudPlatform get platform;
+  bool canUploadTo(BrowseSession session, String parent) =>
+      session.canManageFiles;
+  bool canCreateFolderIn(BrowseSession session, String parent) =>
+      session.canManageFiles && platform.canCreateFolder;
+  bool canRenameFile(BrowseSession session, CloudFile file) =>
+      session.canManageFiles;
+  bool canDeleteFile(BrowseSession session, CloudFile file) =>
+      session.canManageFiles;
+  bool canMoveFile(BrowseSession session, CloudFile file) =>
+      session.canManageFiles;
+  bool canDownloadFile(BrowseSession session, CloudFile file) => true;
   Future<CloudAccount> account(Credential credential);
   Future<BrowseSession> openShare(ParsedLink link, Credential? credential);
   Future<BrowseSession> openPersonal(Credential credential);

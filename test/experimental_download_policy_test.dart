@@ -5,10 +5,26 @@ import 'package:asterlink/data/http.dart';
 import 'package:asterlink/data/providers/cookie_cloud.dart';
 import 'package:asterlink/data/state_store.dart';
 import 'package:asterlink/domain/models.dart';
+import 'package:asterlink/domain/settings.dart';
 import 'support.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+  test(
+    'UC guest priority migrates once and later respects an explicit choice',
+    () {
+      expect(const AppSettings().ucGuestDirectDownload, isTrue);
+      expect(
+        AppSettings.fromJson({
+          'ucGuestDirectDownload': false,
+        }).ucGuestDirectDownload,
+        isTrue,
+      );
+      final saved = const AppSettings(ucGuestDirectDownload: false).toJson();
+      expect(AppSettings.fromJson(saved).ucGuestDirectDownload, isFalse);
+      expect(AppSettings.fromJson({}).quarkGuestDirectDownload, isFalse);
+    },
+  );
   for (final platform in [CloudPlatform.quark, CloudPlatform.uc]) {
     final quark = platform == CloudPlatform.quark;
     final domain = quark ? 'quark.cn' : 'uc.cn';
@@ -101,7 +117,10 @@ void main() {
       '${platform.key} signed-in direct downloads follow the current flag',
       () async {
         final http = transport(requireAccount: true);
-        final services = servicesFor(http, {});
+        final services = servicesFor(http, {
+          guestFlag: false,
+          'ucGuestDownloadPolicy': 1,
+        });
         final connector =
             services.cloud.connector(platform) as CookieCloudConnector;
         expect(
@@ -173,8 +192,27 @@ void main() {
         } else {
           // Old UC settings must not re-enable the removed authenticated feature.
           expect(spec, isNull);
-          expect(http.calls, isEmpty);
+          expect(http.calls, hasLength(1));
+          expect(http.calls.single.headers['Cookie'], isEmpty);
           expect(services.settings.toJson().containsKey(flag), isFalse);
+        }
+      },
+    );
+    test(
+      '${platform.key} default guest priority applies only to UC when signed in',
+      () async {
+        final http = transport();
+        final services = servicesFor(http, {});
+        final connector =
+            services.cloud.connector(platform) as CookieCloudConnector;
+        final spec = await connector.tryShareDownload(session, file, account);
+        if (quark) {
+          expect(spec, isNull);
+          expect(http.calls, isEmpty);
+        } else {
+          expect(spec!.guestDownload, isTrue);
+          expect(http.calls, hasLength(2));
+          expect(http.calls.first.headers['Cookie'], isEmpty);
         }
       },
     );

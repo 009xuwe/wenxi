@@ -94,6 +94,30 @@ class DownloadKeepAliveTest {
         assertTrue(shadowOf(service).isStoppedBySelf)
     }
 
+    @Test fun uploadNoticeShowsTransferActionAndTargetsUploadPage() {
+        keeper.update(DownloadNotice.from(mapOf("active" to 1, "uploads" to 1, "text" to "上传 1 · 2 MB/s", "progress" to 40)), Reply())
+        val service = createService()
+        service.onStartCommand(Intent(), 0, 1)
+        val notice = shadowOf(service).lastForegroundNotification
+        assertEquals("文析助手 · 1 个传输任务", notice.extras.getString(Notification.EXTRA_TITLE))
+        assertEquals("停止传输", notice.actions.single().title)
+        val intent = shadowOf(notice.contentIntent).savedIntent
+        assertEquals("com.asterlink.app.OPEN_TRANSFERS", intent.action)
+        assertEquals("uploads", intent.getStringExtra("transferTab"))
+        assertTrue(service.wakeLockHeld)
+    }
+
+    @Test fun lanListenerKeepsServiceAliveAndReturnsToDevicePage() {
+        keeper.update(DownloadNotice.from(mapOf("active" to 1, "lan" to 1, "text" to "设备互联已开启")), Reply())
+        val service = createService()
+        service.onStartCommand(Intent(), 0, 1)
+        val notice = shadowOf(service).lastForegroundNotification
+        assertEquals("文析助手 · 设备互联", notice.extras.getString(Notification.EXTRA_TITLE))
+        assertEquals("停止传输", notice.actions.single().title)
+        assertEquals("lan", shadowOf(notice.contentIntent).savedIntent.getStringExtra("transferTab"))
+        assertTrue(service.wakeLockHeld)
+    }
+
     @Test fun stickyRestartWaitsForDartAndShowsRestoringNotification() {
         start()
         controllers.last().destroy()

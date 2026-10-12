@@ -21,11 +21,15 @@ import 'ui/cloud_page.dart';
 import 'ui/cloud_accounts_page.dart';
 import 'ui/clipboard_link_banner.dart';
 import 'ui/common.dart';
+import 'ui/app_theme.dart';
+import 'ui/app_background.dart';
+export 'ui/app_theme.dart' show appTheme;
 import 'ui/startup_loading_page.dart';
-import 'ui/downloads_page.dart';
+import 'ui/transfers_page.dart';
 import 'ui/mine_page.dart';
 import 'ui/parse_page.dart';
-import 'ui/parse_menu.dart';
+import 'ui/announcements_page.dart';
+import 'ui/device_link_page.dart';
 import 'ui/donate_page.dart';
 import 'ui/about_dialog.dart';
 import 'ui/download_shutdown_prompt.dart';
@@ -131,87 +135,6 @@ class _BootstrapState extends State<_Bootstrap> {
   );
 }
 
-ThemeData appTheme(Brightness brightness, {String? fontFamily}) {
-  final dark = brightness == Brightness.dark;
-  final windows = defaultTargetPlatform == TargetPlatform.windows;
-  final resolvedFont = fontFamily ?? (windows ? 'Microsoft YaHei UI' : null);
-  final fallbackFonts = windows ? const ['Microsoft YaHei', 'Segoe UI'] : null;
-  final surface = dark ? const Color(0xff101012) : Colors.white;
-  final colors =
-      ColorScheme.fromSeed(
-        seedColor: brandBlue,
-        brightness: brightness,
-      ).copyWith(
-        primary: brandBlue,
-        surface: surface,
-        onSurface: dark ? const Color(0xfff5f5f7) : const Color(0xff111111),
-      );
-  return ThemeData(
-    useMaterial3: true,
-    brightness: brightness,
-    colorScheme: colors,
-    fontFamily: resolvedFont,
-    fontFamilyFallback: fallbackFonts,
-    scaffoldBackgroundColor: surface,
-    dividerColor: dark ? const Color(0xff38383a) : const Color(0xffe5e5e7),
-    appBarTheme: AppBarTheme(
-      backgroundColor: surface,
-      surfaceTintColor: Colors.transparent,
-      centerTitle: true,
-      elevation: 0,
-      scrolledUnderElevation: 0,
-      toolbarHeight: 56,
-      titleTextStyle: TextStyle(
-        fontFamily: resolvedFont,
-        fontFamilyFallback: fallbackFonts,
-        fontSize: 17,
-        fontWeight: FontWeight.w700,
-        color: colors.onSurface,
-      ),
-    ),
-    inputDecorationTheme: InputDecorationTheme(
-      filled: true,
-      fillColor: dark ? const Color(0xff1c1c1e) : const Color(0xfff5f5f8),
-      contentPadding: const EdgeInsets.all(14),
-      border: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(12),
-        borderSide: BorderSide.none,
-      ),
-      enabledBorder: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(12),
-        borderSide: BorderSide.none,
-      ),
-      focusedBorder: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(12),
-        borderSide: const BorderSide(color: brandBlue, width: 1),
-      ),
-    ),
-    filledButtonTheme: FilledButtonThemeData(
-      style: FilledButton.styleFrom(
-        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-      ),
-    ),
-    outlinedButtonTheme: OutlinedButtonThemeData(
-      style: OutlinedButton.styleFrom(
-        padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-      ),
-    ),
-    dialogTheme: DialogThemeData(
-      backgroundColor: dark ? const Color(0xff1c1c1e) : Colors.white,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
-    ),
-    bottomSheetTheme: BottomSheetThemeData(
-      backgroundColor: surface,
-      surfaceTintColor: Colors.transparent,
-    ),
-    tooltipTheme: const TooltipThemeData(
-      waitDuration: Duration(milliseconds: 500),
-    ),
-  );
-}
-
 class AsterLinkApp extends StatelessWidget {
   const AsterLinkApp(
     this.services, {
@@ -225,23 +148,48 @@ class AsterLinkApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) => AnimatedBuilder(
     animation: services.store,
-    builder: (context, _) => MaterialApp(
-      title: '文析助手',
-      debugShowCheckedModeBanner: false,
-      locale: const Locale('zh', 'CN'),
-      supportedLocales: const [Locale('zh', 'CN'), Locale('en')],
-      localizationsDelegates: GlobalMaterialLocalizations.delegates,
-      theme: appTheme(Brightness.light, fontFamily: fontFamily),
-      darkTheme: appTheme(Brightness.dark, fontFamily: fontFamily),
-      themeMode: switch (services.settings.theme) {
-        'Light' => ThemeMode.light,
-        'Dark' => ThemeMode.dark,
-        _ => ThemeMode.system,
-      },
-      builder: (context, child) =>
-          WindowsWindowTheme(enabled: services.platformFeatures, child: child!),
-      home: MainShell(services, initialTab: initialTab),
-    ),
+    builder: (context, _) {
+      final settings = services.settings;
+      return MaterialApp(
+        title: '文析助手',
+        debugShowCheckedModeBanner: false,
+        locale: const Locale('zh', 'CN'),
+        supportedLocales: const [Locale('zh', 'CN'), Locale('en')],
+        localizationsDelegates: GlobalMaterialLocalizations.delegates,
+        theme: appTheme(
+          Brightness.light,
+          fontFamily: fontFamily,
+          palette: settings.themePalette,
+          glassStyle: settings.glassStyle,
+        ),
+        darkTheme: appTheme(
+          Brightness.dark,
+          fontFamily: fontFamily,
+          palette: settings.themePalette,
+          glassStyle: settings.glassStyle,
+        ),
+        themeAnimationDuration:
+            (MediaQuery.maybeDisableAnimationsOf(context) ??
+                WidgetsBinding
+                    .instance
+                    .platformDispatcher
+                    .accessibilityFeatures
+                    .disableAnimations)
+            ? Duration.zero
+            : const Duration(milliseconds: 240),
+        themeAnimationCurve: Curves.easeOutCubic,
+        themeMode: switch (settings.theme) {
+          'Light' => ThemeMode.light,
+          'Dark' => ThemeMode.dark,
+          _ => ThemeMode.system,
+        },
+        builder: (context, child) => WindowsWindowTheme(
+          enabled: services.platformFeatures,
+          child: child!,
+        ),
+        home: MainShell(services, initialTab: initialTab),
+      );
+    },
   );
 }
 
@@ -265,12 +213,16 @@ class _MainShellState extends State<MainShell>
   final parseKey = GlobalKey<ParsePageState>();
   bool trayReady = false, closing = false;
   bool _openingExternal = false, _externalScheduled = false;
-  static const titles = ['分享解析', '网盘列表', '下载管理', '我的'];
+  bool _openingLan = false;
+  static const titles = ['分享解析', '网盘列表', '传输管理', '我的'];
   @override
   void initState() {
     super.initState();
     widget.services.sharedText.addListener(_shared);
+    if (widget.services.downloadNavigation.value > 0) selected = 2;
     widget.services.downloadNavigation.addListener(_showDownloads);
+    widget.services.lanNavigation.addListener(_showLan);
+    widget.services.transferTab.addListener(_transferTabChanged);
     widget.services.externalOpens.addListener(_externalAvailable);
     widget.services.clipboard.addListener(_clipboardChanged);
     WidgetsBinding.instance.addObserver(this);
@@ -283,7 +235,14 @@ class _MainShellState extends State<MainShell>
       widget.services.control.setForeground(
         state == null || state == AppLifecycleState.resumed,
       );
+      widget.services.announcements.setForeground(
+        state == null || state == AppLifecycleState.resumed,
+      );
+      if (state == null || state == AppLifecycleState.resumed) {
+        widget.services.refreshPublicDownloadPassword();
+      }
       _externalAvailable();
+      if (widget.services.lanNavigation.value > 0) _showLan();
     });
     if (Platform.isWindows && widget.services.platformFeatures) {
       windowManager.addListener(this);
@@ -296,11 +255,26 @@ class _MainShellState extends State<MainShell>
     if (mounted) setState(() {});
   }
 
+  void _transferTabChanged() {
+    if (mounted) setState(() {});
+  }
+
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     widget.services.clipboard.setForeground(state == AppLifecycleState.resumed);
     widget.services.control.setForeground(state == AppLifecycleState.resumed);
-    if (state == AppLifecycleState.resumed) _externalAvailable();
+    widget.services.announcements.setForeground(
+      state == AppLifecycleState.resumed,
+    );
+    if (state == AppLifecycleState.resumed) {
+      widget.services.refreshPublicDownloadPassword();
+      _externalAvailable();
+    }
+  }
+
+  @override
+  void didChangePlatformBrightness() {
+    widget.services.downloadOverlay.refreshAppearance();
   }
 
   void _externalAvailable() {
@@ -363,6 +337,7 @@ class _MainShellState extends State<MainShell>
         } else {
           final url = request.downloadUrl;
           if (url != null) {
+            widget.services.transferTab.value = 0;
             setState(() => selected = 2);
             await directDownloadDialog(
               context,
@@ -370,6 +345,7 @@ class _MainShellState extends State<MainShell>
               initial: url,
               fileName: request.name,
               headers: request.headers,
+              external: true,
             );
           } else {
             setState(() => selected = 0);
@@ -391,12 +367,15 @@ class _MainShellState extends State<MainShell>
   void onWindowFocus() {
     widget.services.clipboard.setForeground(true);
     widget.services.control.setForeground(true);
+    widget.services.announcements.setForeground(true);
+    widget.services.refreshPublicDownloadPassword();
   }
 
   @override
   void onWindowBlur() {
     widget.services.clipboard.setForeground(false);
     widget.services.control.setForeground(false);
+    widget.services.announcements.setForeground(false);
   }
 
   void _useClipboard() {
@@ -420,6 +399,33 @@ class _MainShellState extends State<MainShell>
     DiagnosticLog.event('ui.tab', fields: {'tab': 'downloads'});
   }
 
+  void _showLan() => unawaited(_openLan());
+
+  Future<void> _openLan() async {
+    if (!mounted || _openingLan) return;
+    _openingLan = true;
+    try {
+      final text = await Navigator.push<String>(
+        context,
+        MaterialPageRoute(
+          builder: (_) => DeviceLinkPage(
+            widget.services,
+            initialText: parseKey.currentState?.input.text ?? '',
+          ),
+        ),
+      );
+      if (!mounted || text == null || text.isEmpty) return;
+      setState(() => selected = 0);
+      await WidgetsBinding.instance.endOfFrame;
+      if (!mounted) return;
+      final parser = parseKey.currentState;
+      parser?.acceptClipboard(text);
+      await parser?.parse();
+    } finally {
+      _openingLan = false;
+    }
+  }
+
   Future<void> _desktop() async {
     try {
       await windowManager.setPreventClose(true);
@@ -430,7 +436,7 @@ class _MainShellState extends State<MainShell>
           items: [
             MenuItem(key: 'show', label: '打开文析助手'),
             MenuItem.separator(),
-            MenuItem(key: 'pause', label: '暂停全部下载'),
+            MenuItem(key: 'pause', label: '停止全部传输'),
             MenuItem(key: 'exit', label: '退出'),
           ],
         ),
@@ -456,7 +462,7 @@ class _MainShellState extends State<MainShell>
   void onTrayMenuItemClick(MenuItem item) {
     if (item.key == 'show') onTrayIconMouseDown();
     if (item.key == 'pause') {
-      busy(context, widget.services.downloads.pauseAll, label: '暂停下载…');
+      busy(context, widget.services.stopTransfers, label: '停止传输…');
     }
     if (item.key == 'exit') _close(forceExit: true);
   }
@@ -470,7 +476,10 @@ class _MainShellState extends State<MainShell>
     if (closing || !mounted) return;
     closing = true;
     try {
-      final active = widget.services.downloads.tasks.any((t) => t.active);
+      final active =
+          widget.services.downloads.tasks.any((t) => t.active) ||
+          widget.services.uploads.activeCount > 0 ||
+          widget.services.lan.running;
       if (active) {
         await windowManager.show();
         await windowManager.focus();
@@ -478,8 +487,12 @@ class _MainShellState extends State<MainShell>
         final action = await showDialog<String>(
           context: context,
           builder: (context) => AlertDialog(
-            title: const Text('还有下载任务'),
-            content: const Text('可保留后台下载，或暂停任务后退出。'),
+            title: const Text('还有传输任务'),
+            content: Text(
+              widget.services.lan.running
+                  ? '设备互联正在运行。可保留后台传输；退出应用会结束文件分享。'
+                  : '可保留后台传输，或停止任务后退出。中断的上传需要重新上传。',
+            ),
             actions: [
               TextButton(
                 onPressed: () => Navigator.pop(context),
@@ -488,7 +501,7 @@ class _MainShellState extends State<MainShell>
               if (trayReady && !forceExit)
                 TextButton(
                   onPressed: () => Navigator.pop(context, 'background'),
-                  child: const Text('后台下载'),
+                  child: const Text('后台传输'),
                 ),
               TextButton(
                 onPressed: () => Navigator.pop(context, 'exit'),
@@ -519,11 +532,14 @@ class _MainShellState extends State<MainShell>
   void dispose() {
     widget.services.sharedText.removeListener(_shared);
     widget.services.downloadNavigation.removeListener(_showDownloads);
+    widget.services.lanNavigation.removeListener(_showLan);
+    widget.services.transferTab.removeListener(_transferTabChanged);
     widget.services.externalOpens.removeListener(_externalAvailable);
     WidgetsBinding.instance.removeObserver(this);
     widget.services.clipboard.removeListener(_clipboardChanged);
     widget.services.clipboard.setForeground(false);
     widget.services.control.setForeground(false);
+    widget.services.announcements.setForeground(false);
     if (Platform.isWindows && widget.services.platformFeatures) {
       windowManager.removeListener(this);
       trayManager.removeListener(this);
@@ -570,6 +586,17 @@ class _MainShellState extends State<MainShell>
         }
       case 'about':
         await showWenxiAbout(context, widget.services.control);
+      case 'donate':
+        await Navigator.push<void>(
+          context,
+          MaterialPageRoute(builder: (_) => const DonatePage()),
+        );
+      case 'stop-uploads':
+        if (await confirm(context, '停止全部上传', '未完成任务将停止，重试时会从头上传。') && mounted) {
+          await busy(context, widget.services.uploads.stopAll);
+        }
+      case 'clear-uploads':
+        await busy(context, widget.services.uploads.clearCompleted);
     }
   }
 
@@ -591,6 +618,18 @@ class _MainShellState extends State<MainShell>
         icon: CupertinoIcons.arrow_clockwise,
       ),
     ],
+    2 when widget.services.transferTab.value == 1 => const [
+      AppMenuAction(
+        value: 'stop-uploads',
+        label: '停止全部上传',
+        icon: CupertinoIcons.stop,
+      ),
+      AppMenuAction(
+        value: 'clear-uploads',
+        label: '清理完成记录',
+        icon: CupertinoIcons.trash,
+      ),
+    ],
     2 => const [
       AppMenuAction(
         value: 'new',
@@ -610,6 +649,7 @@ class _MainShellState extends State<MainShell>
       ),
     ],
     _ => const [
+      AppMenuAction(value: 'donate', label: '打赏作者', icon: CupertinoIcons.gift),
       AppMenuAction(
         value: 'about',
         label: '关于文析助手',
@@ -620,6 +660,7 @@ class _MainShellState extends State<MainShell>
   Widget _navigation(BuildContext context, {required bool rail}) =>
       AppNavigation(
         selectedIndex: selected,
+        transfers: widget.services.navigationTransfers,
         rail: rail,
         onSelected: (index) {
           DiagnosticLog.event(
@@ -655,126 +696,150 @@ class _MainShellState extends State<MainShell>
       autofocus: true,
       child: LayoutBuilder(
         builder: (context, constraints) {
-          final rail = constraints.maxWidth >= 820;
-          final desktopHeader =
-              (selected == 0 || selected == 3) &&
-              Theme.of(context).platform == TargetPlatform.windows;
-          final content = Scaffold(
-            extendBody: !rail,
-            backgroundColor: Theme.of(context).brightness == Brightness.dark
-                ? const Color(0xff101012)
-                : const Color(0xfff7f8fb),
-            appBar: AppBar(
-              title: Text(titles[selected]),
-              centerTitle: desktopHeader ? false : null,
-              titleSpacing: desktopHeader ? 28 : null,
-              toolbarHeight: desktopHeader ? 52 : null,
-              actions: [
-                Padding(
-                  padding: const EdgeInsets.only(right: 8),
-                  child: selected == 0
-                      ? ParseMenuButton(
-                          control: widget.services.control,
-                          updater: widget.services.appUpdates,
-                          onDonate: () => Navigator.push<void>(
-                            context,
-                            MaterialPageRoute(
-                              builder: (_) => const DonatePage(),
+          return AppBackground(
+            repository: widget.services.backgrounds,
+            settings: widget.services.settings.background,
+            child: Builder(
+              builder: (context) {
+                final rail = constraints.maxWidth >= 820;
+                final desktopHeader =
+                    (selected == 0 || selected == 3) &&
+                    Theme.of(context).platform == TargetPlatform.windows;
+                final content = Scaffold(
+                  extendBody: !rail,
+                  backgroundColor: BackgroundScope.of(context)?.active == true
+                      ? Colors.transparent
+                      : Theme.of(context).brightness == Brightness.dark
+                      ? const Color(0xff101012)
+                      : const Color(0xfff7f8fb),
+                  appBar: AppBar(
+                    backgroundColor: backgroundSurface(context),
+                    title: Text(titles[selected]),
+                    centerTitle: desktopHeader ? false : null,
+                    titleSpacing: desktopHeader ? 28 : null,
+                    toolbarHeight: desktopHeader ? 52 : null,
+                    actions: [
+                      if (selected == 0)
+                        AnimatedBuilder(
+                          animation: widget.services.lan,
+                          builder: (context, _) => Tooltip(
+                            message: '设备互联',
+                            child: TextButton.icon(
+                              key: const Key('parse-device-link'),
+                              onPressed: _showLan,
+                              icon: Badge.count(
+                                count: widget.services.lan.unread,
+                                isLabelVisible: widget.services.lan.unread > 0,
+                                child: const Icon(
+                                  Icons.devices_rounded,
+                                  size: 21,
+                                ),
+                              ),
+                              label: const Text('互联'),
                             ),
                           ),
-                        )
-                      : AppPopupMenuButton<String>(
-                          tooltip: '更多操作',
-                          onSelected: _menu,
-                          actions: menu,
-                          icon: CupertinoIcons.ellipsis,
                         ),
-                ),
-              ],
-            ),
-            body: SafeArea(
-              top: false,
-              bottom: rail,
-              child: Center(
-                child: ConstrainedBox(
-                  constraints: const BoxConstraints(maxWidth: 1120),
-                  child: Column(
-                    children: [
-                      RemoteControlPrompts(
-                        widget.services.control,
-                        updater: widget.services.appUpdates,
-                      ),
-                      GuestDownloadPrompt(widget.services),
-                      DownloadShutdownPrompt(
-                        widget.services.downloadShutdown,
-                        showWindow:
-                            widget.services.platformFeatures &&
-                                Platform.isWindows
-                            ? () async {
-                                await windowManager.show();
-                                await windowManager.focus();
-                              }
-                            : null,
-                      ),
-                      if (widget.services.clipboard.suggestion
-                          case final suggestion?)
-                        ClipboardLinkBanner(
-                          suggestion: suggestion,
-                          onUse: _useClipboard,
-                          onDismiss: () => unawaited(
-                            widget.services.clipboard.acknowledge(suggestion),
-                          ),
-                        ),
-                      Expanded(
-                        child: IndexedStack(
-                          index: selected,
-                          children: [
-                            ParsePage(
-                              widget.services,
-                              key: parseKey,
-                              active: selected == 0,
-                            ),
-                            CloudPage(
-                              widget.services,
-                              onParseShare: () {
-                                setState(() => selected = 0);
-                                WidgetsBinding.instance.addPostFrameCallback((
-                                  _,
-                                ) {
-                                  if (mounted && selected == 0) {
-                                    parseKey.currentState?.focus.requestFocus();
-                                  }
-                                });
-                              },
-                            ),
-                            DownloadsPage(
-                              widget.services,
-                              active: selected == 2,
-                            ),
-                            MinePage(widget.services),
-                          ],
-                        ),
+                      Padding(
+                        padding: const EdgeInsets.only(right: 8),
+                        child: selected == 0
+                            ? AnnouncementButton(widget.services.announcements)
+                            : AppPopupMenuButton<String>(
+                                tooltip: '更多操作',
+                                onSelected: _menu,
+                                actions: menu,
+                                icon: CupertinoIcons.ellipsis,
+                              ),
                       ),
                     ],
                   ),
-                ),
-              ),
-            ),
-            bottomNavigationBar: rail
-                ? null
-                : _navigation(context, rail: false),
-          );
-          return rail
-              ? Row(
-                  children: [
-                    Material(
-                      color: Theme.of(context).colorScheme.surface,
-                      child: _navigation(context, rail: true),
+                  body: SafeArea(
+                    top: false,
+                    bottom: rail,
+                    child: Center(
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(maxWidth: 1120),
+                        child: Column(
+                          children: [
+                            RemoteControlPrompts(
+                              widget.services.control,
+                              updater: widget.services.appUpdates,
+                            ),
+                            GuestDownloadPrompt(widget.services),
+                            DownloadShutdownPrompt(
+                              widget.services.downloadShutdown,
+                              showWindow:
+                                  widget.services.platformFeatures &&
+                                      Platform.isWindows
+                                  ? () async {
+                                      await windowManager.show();
+                                      await windowManager.focus();
+                                    }
+                                  : null,
+                            ),
+                            if (widget.services.clipboard.suggestion
+                                case final suggestion?)
+                              ClipboardLinkBanner(
+                                suggestion: suggestion,
+                                onUse: _useClipboard,
+                                onDismiss: () => unawaited(
+                                  widget.services.clipboard.acknowledge(
+                                    suggestion,
+                                  ),
+                                ),
+                              ),
+                            Expanded(
+                              child: IndexedStack(
+                                index: selected,
+                                children: [
+                                  ParsePage(
+                                    widget.services,
+                                    key: parseKey,
+                                    active: selected == 0,
+                                  ),
+                                  CloudPage(
+                                    widget.services,
+                                    onParseShare: () {
+                                      setState(() => selected = 0);
+                                      WidgetsBinding.instance
+                                          .addPostFrameCallback((_) {
+                                            if (mounted && selected == 0) {
+                                              parseKey.currentState?.focus
+                                                  .requestFocus();
+                                            }
+                                          });
+                                    },
+                                  ),
+                                  TransfersPage(
+                                    widget.services,
+                                    active: selected == 2,
+                                  ),
+                                  MinePage(widget.services),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
                     ),
-                    Expanded(child: content),
-                  ],
-                )
-              : content;
+                  ),
+                  bottomNavigationBar: rail
+                      ? null
+                      : _navigation(context, rail: false),
+                );
+                return rail
+                    ? Row(
+                        children: [
+                          Material(
+                            color: backgroundSurface(context),
+                            child: _navigation(context, rail: true),
+                          ),
+                          Expanded(child: content),
+                        ],
+                      )
+                    : content;
+              },
+            ),
+          );
         },
       ),
     ),

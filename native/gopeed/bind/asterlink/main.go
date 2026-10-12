@@ -35,26 +35,29 @@ var generations = map[string]string{} // Protected by stateMu, including listene
 var safeID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,100}$`)
 
 type snapshot struct {
-	Status            string     `json:"status"`
-	Total             int64      `json:"total"`
-	Downloaded        int64      `json:"downloaded"`
-	Speed             int64      `json:"speed"`
-	ActiveConnections int        `json:"activeConnections"`
-	TotalConnections  int        `json:"totalConnections"`
-	HTTPCode          int        `json:"httpCode"`
-	RetryAfterMS      int64      `json:"retryAfterMs"`
-	RetryExhausted    bool       `json:"retryExhausted"`
-	ErrorKind         string     `json:"errorKind"`
-	Error             string     `json:"error"`
-	Path              string     `json:"path"`
-	ReadableRanges    [][2]int64 `json:"readableRanges,omitempty"`
+	Status            string                     `json:"status"`
+	Total             int64                      `json:"total"`
+	Downloaded        int64                      `json:"downloaded"`
+	Speed             int64                      `json:"speed"`
+	ActiveConnections int                        `json:"activeConnections"`
+	TotalConnections  int                        `json:"totalConnections"`
+	HTTPCode          int                        `json:"httpCode"`
+	RetryAfterMS      int64                      `json:"retryAfterMs"`
+	RetryExhausted    bool                       `json:"retryExhausted"`
+	ErrorKind         string                     `json:"errorKind"`
+	Error             string                     `json:"error"`
+	Path              string                     `json:"path"`
+	ReadableRanges    [][2]int64                 `json:"readableRanges,omitempty"`
+	Aliyun            *fhttp.AliyunTransferState `json:"aliyun,omitempty"`
 }
 type request struct {
 	ID                string            `json:"id"`
+	CacheRoot         string            `json:"cacheRoot,omitempty"`
 	URL               string            `json:"url"`
 	Headers           map[string]string `json:"headers"`
 	Connections       int               `json:"connections"`
 	ConnectionProfile string            `json:"connectionProfile"`
+	AliyunGroup       string            `json:"aliyunGroup"`
 	Retries           int               `json:"retries"`
 	SpeedLimit        int64             `json:"speedLimit"`
 	TorrentData       string            `json:"torrentData"`
@@ -143,6 +146,7 @@ func remember(event *download.Event) {
 	value := snapshot{Status: string(task.Status)}
 	active, total := task.ConnectionCounts()
 	value.TotalConnections = total
+	value.Aliyun = task.AliyunTransferState()
 	if task.Status == base.DownloadStatusRunning {
 		value.ActiveConnections = active
 	}
@@ -217,6 +221,12 @@ func Begin(value string) error {
 	if input.Connections < 1 || input.Connections > 512 {
 		return errors.New("connections must be in 1..512")
 	}
+	if input.ConnectionProfile == "aliyun" && input.AliyunGroup != "" {
+		decoded, err := hex.DecodeString(input.AliyunGroup)
+		if err != nil || len(decoded) != 32 {
+			return errors.New("invalid Aliyun account group")
+		}
+	}
 	if input.Retries < 0 || input.Retries > 3 || input.SpeedLimit < 0 {
 		return errors.New("invalid retry or speed limit")
 	}
@@ -227,8 +237,8 @@ func Begin(value string) error {
 	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 		return errors.New("invalid HTTP download URL")
 	}
-	dir := filepath.Join(payloadRoot, input.ID)
-	if err = os.MkdirAll(dir, 0700); err != nil {
+	dir, err := taskPayloadDirectory(input)
+	if err != nil {
 		return err
 	}
 	req := &base.Request{URL: input.URL, Extra: &fhttp.ReqExtra{Header: input.Headers}, Labels: map[string]string{"asterlinkId": input.ID}}
@@ -246,12 +256,17 @@ func Begin(value string) error {
 					return nil
 				}
 				req.Labels["asterlinkGeneration"] = task.Meta.Req.Labels["asterlinkGeneration"]
-				if err = core.ReplacePausedRequest(taskID, req, input.ConnectionProfile); err != nil {
+				if err = core.ReplacePausedRequest(taskID, req, input.ConnectionProfile, &fhttp.OptsExtra{Connections: input.Connections, AliyunGroup: input.AliyunGroup}); err != nil {
 					return err
 				}
+				aliyun := task.AliyunTransferState()
 				stateMu.Lock()
 				progress := states[input.ID]
 				progress.Status, progress.Error, progress.HTTPCode = "running", "", 0
+				if input.ConnectionProfile == "aliyun" {
+					progress.Aliyun, progress.ActiveConnections = aliyun, 0
+					progress.RetryAfterMS, progress.RetryExhausted, progress.ErrorKind = 0, false, ""
+				}
 				states[input.ID] = progress
 				stateMu.Unlock()
 				return core.ContinueBatch(&download.TaskFilter{IDs: []string{taskID}})
@@ -277,7 +292,7 @@ func Begin(value string) error {
 	stateMu.Unlock()
 	retries := input.Retries
 	taskID, err := core.CreateDirect(req, &base.Options{Name: "payload.gopeed", Path: dir,
-		Extra: &fhttp.OptsExtra{Connections: input.Connections, ConnectionProfile: input.ConnectionProfile,
+		Extra: &fhttp.OptsExtra{Connections: input.Connections, ConnectionProfile: input.ConnectionProfile, AliyunGroup: input.AliyunGroup,
 			RetryLimit: &retries, SpeedLimit: input.SpeedLimit}})
 	if err != nil {
 		return err
@@ -302,12 +317,12 @@ func payloadPresent(task *download.Task, dir string) bool {
 }
 
 func clearTaskPayload(dir string) error {
-	if filepath.Clean(filepath.Dir(dir)) != payloadRoot || !safeID.MatchString(filepath.Base(dir)) {
+	root := filepath.Dir(dir)
+	if !validPayloadRoot(root) || !safeID.MatchString(filepath.Base(dir)) {
 		return errors.New("invalid task cache directory")
 	}
-	info, err := os.Lstat(dir)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return errors.New("invalid task cache directory")
+	if err := checkTaskPayloadDirectory(root, dir); err != nil {
+		return err
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {

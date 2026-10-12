@@ -30,6 +30,8 @@ class NativeBridge(private val context: Context, engine: FlutterEngine) {
     private val channel = MethodChannel(engine.dartExecutor.binaryMessenger, "com.asterlink.app/native")
     private val main = Handler(Looper.getMainLooper())
     private val io = Executors.newFixedThreadPool(3)
+    private val lanFiles = LanFiles(context)
+    private val lanQrScanner = LanQrScanner { activity }
     private val nativeWorker = Executors.newSingleThreadExecutor()
     private val externalWorker = Executors.newSingleThreadExecutor()
     private val externalParser = ExternalOpenRequest(context)
@@ -61,9 +63,15 @@ class NativeBridge(private val context: Context, engine: FlutterEngine) {
         })
     }, { value -> emit("downloadOverlayState", value) }, { event, error -> diagnostics.record(event, error) })
 
+    private var pendingTransferTab: String? = null
     init { channel.setMethodCallHandler(::handle) }
     fun emit(method: String, value: Any? = null) { main.post { channel.invokeMethod(method, value) } }
     fun receiveIntent(intent: Intent?, id: String) {
+        if (intent?.action == "com.asterlink.app.OPEN_TRANSFERS") {
+            pendingTransferTab = intent.getStringExtra("transferTab") ?: "downloads"
+            emit("openTransfers", pendingTransferTab)
+            return
+        }
         if (intent?.action == DownloadOverlay.OPEN_DOWNLOADS) {
             emit("downloadOverlayAction", mapOf("action" to "openDownloads"))
             return
@@ -76,6 +84,35 @@ class NativeBridge(private val context: Context, engine: FlutterEngine) {
         }
     }
     private fun handle(call: MethodCall, result: MethodChannel.Result) {
+        if (call.method == "takeTransferNavigation") {
+            result.success(pendingTransferTab)
+            pendingTransferTab = null
+            return
+        }
+        if (call.method == "readStateKey" || call.method == "writeStateKey") {
+            io.execute {
+                val bytes = call.argument<ByteArray>("value")
+                try {
+                    val namespace = call.argument<String>("namespace").orEmpty()
+                    val vault = StateKeyVault(context)
+                    val value: Any? = if (call.method == "readStateKey") {
+                        vault.read(namespace, call.argument<Boolean>("copy") == true)
+                    } else {
+                        require(bytes != null)
+                        vault.writeFresh(namespace, bytes)
+                        true
+                    }
+                    main.post { result.success(value) }
+                } catch (error: Exception) {
+                    val category = StateKeyVault.diagnostic(error)
+                    diagnostics.record("state_key.native_failed", IllegalStateException(category))
+                    main.post { result.error("state_key_storage", "系统密钥存储读写失败", category) }
+                } finally {
+                    bytes?.fill(0)
+                }
+            }
+            return
+        }
         if (call.method == "flushStateKeyStorage") {
             val namespace = call.argument<String>("namespace")
             io.execute {
@@ -146,6 +183,21 @@ class NativeBridge(private val context: Context, engine: FlutterEngine) {
             }
             return
         }
+        if (call.method == "savePlayerScreenshot") {
+            val bytes = call.argument<ByteArray>("bytes")
+            val name = call.argument<String>("name").orEmpty()
+            io.execute {
+                try {
+                    require(bytes != null)
+                    val saved = PlayerScreenshotSaver(context).save(name, bytes)
+                    main.post { result.success(saved) }
+                } catch (error: Exception) {
+                    diagnostics.record("player.screenshot_save_failed", error)
+                    main.post { result.error("screenshot", "截图保存失败，请检查存储空间", null) }
+                }
+            }
+            return
+        }
         if (call.method == "saveDocument") {
             val current = activity
             val bytes = call.argument<ByteArray>("bytes")
@@ -159,6 +211,14 @@ class NativeBridge(private val context: Context, engine: FlutterEngine) {
                     .setType(call.argument<String>("mime") ?: "application/json")
                     .putExtra(Intent.EXTRA_TITLE, call.argument<String>("name") ?: "文析助手-backup.json"), 833)
             } catch (_: Exception) { picker = null; documentBytes = null; result.error("document", "无法打开文件保存窗口", null) }
+            return
+        }
+        if (call.method == "lanPickFiles") {
+            lanFiles.pick(activity, result)
+            return
+        }
+        if (call.method == "lanScanQr") {
+            lanQrScanner.scan(result)
             return
         }
         if (call.method == "openFile" || call.method == "shareFile") {
@@ -203,6 +263,13 @@ class NativeBridge(private val context: Context, engine: FlutterEngine) {
                         call.argument<String>("version").orEmpty(),
                         call.argument<Number>("build")?.toLong() ?: 0,
                     )
+                    "lanScan" -> lanFiles.scan(call.argument<String>("path").orEmpty(), call.argument<Boolean>("folder") == true)
+                    "lanStat" -> lanFiles.stat(call.argument<String>("path").orEmpty())
+                    "lanOpenRead" -> lanFiles.open(call.argument<String>("path").orEmpty(), call.argument<Number>("offset")?.toLong() ?: 0)
+                    "lanRead" -> lanFiles.read(call.argument<String>("id").orEmpty(), call.argument<Number>("length")?.toInt() ?: 0)
+                    "lanCloseRead" -> { lanFiles.close(call.argument<String>("id").orEmpty()); null }
+                    "lanNetwork" -> { lanFiles.network(call.argument<Boolean>("enabled") == true); null }
+                    "lanCreateDirectories" -> { lanFiles.createDirectories(call.argument<String>("destination").orEmpty(), call.argument<List<String>>("directories") ?: emptyList()); null }
                     "subtitleFontFiles" -> SubtitleFontFiles.available()
                     "diagnosticPaths" -> mapOf("logs" to File(context.noBackupFilesDir, "diagnostics_flutter").absolutePath, "enabled" to diagnostics.enabled)
                     "diagnosticSnapshot" -> diagnostics.snapshot() + mapOf("downloadProtection" to downloadProtection.status())
@@ -253,6 +320,7 @@ class NativeBridge(private val context: Context, engine: FlutterEngine) {
             } catch (error: Throwable) {
                 if (!call.method.startsWith("diagnostic")) diagnostics.record("bridge.${call.method}", error)
                 val message = when (call.method) {
+                    "lanScan", "lanStat", "lanOpenRead", "lanRead", "lanCreateDirectories" -> error.message ?: "所选文件不可访问，请重新选择"
                     "prepareAppUpdate" -> error.message ?: "安装包校验失败，请重新下载或使用浏览器更新"
                     "legacySnapshot" -> "旧版数据读取失败，原文件已保留，可稍后重试导入"
                     "deleteFile" -> "文件未能删除，请检查目录权限后重试"
@@ -264,6 +332,8 @@ class NativeBridge(private val context: Context, engine: FlutterEngine) {
         }
     }
     fun activityResult(requestCode: Int, resultCode: Int, data: Intent?): Boolean {
+        if (lanQrScanner.activityResult(requestCode, resultCode, data)) return true
+        if (lanFiles.activityResult(requestCode, resultCode, data)) return true
         if (fileOpening.activityResult(requestCode)) return true
         if (requestCode == 833) {
             val result = picker ?: return true

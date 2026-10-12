@@ -127,11 +127,9 @@ Dialogue: 0,0:00:00.00,0:00:08.00,Default,,0,0,0,,{\an7\pos(16,20)}原生中文�
           backend.diagnosticFields['subtitleFontSource'],
           source == 'late-download' ? 'download' : source,
         );
-        final clean = await player.screenshot(format: 'image/png');
-        final styled = await player.screenshot(
-          format: 'image/png',
-          includeLibassSubtitles: true,
-        );
+        expect(backend.supportsScreenshot, isTrue);
+        final clean = await backend.screenshot();
+        final styled = await backend.screenshot(includeSubtitles: true);
         expect(clean, isNotNull);
         expect(styled, isNotNull);
         final cleanCodec = await ui.instantiateImageCodec(clean!);
@@ -166,6 +164,189 @@ Dialogue: 0,0:00:00.00,0:00:08.00,Default,,0,0,0,,{\an7\pos(16,20)}原生中文�
           : false,
     );
   }
+
+  test(
+    'Native plain text minimum removes the implicit libass bottom margin',
+    () async {
+      MediaKit.ensureInitialized(libmpv: library);
+      final player = Player(
+        configuration: const PlayerConfiguration(libass: true, vo: 'null'),
+      );
+      final backend = MediaKitBackend(video: false, player: player);
+      addTearDown(backend.close);
+      final native = player.platform as NativePlayer;
+      await native.setProperty('ao', 'null');
+      await native.setProperty('vid', 'auto');
+      await backend.open(
+        DownloadSpec(
+          url: File('test/fixtures/player-sample.mkv').absolute.path,
+          fileName: 'sample.mkv',
+        ),
+        Duration.zero,
+      );
+      await backend.setSubtitleTrack(
+        SubtitleTrack.uri(
+          File('test/fixtures/player-external.srt').absolute.uri.toString(),
+        ),
+      );
+      await native.setProperty('sub-font-size', '88');
+      await native.setProperty('sub-scale', '1');
+      await native.setProperty('sub-pos', '100');
+      await native.setProperty('sub-margin-y', '34');
+      await backend.play();
+      await until(
+        () =>
+            player.state.position.inMilliseconds >= 1100 &&
+            (player.state.width ?? 0) > 1,
+      );
+      await backend.pause();
+
+      Future<int> subtitleBottom() async {
+        final clean = (await player.screenshot(format: 'image/png'))!;
+        final styled = (await player.screenshot(
+          format: 'image/png',
+          includeLibassSubtitles: true,
+        ))!;
+        final cleanCodec = await ui.instantiateImageCodec(clean);
+        final styledCodec = await ui.instantiateImageCodec(styled);
+        final a = (await cleanCodec.getNextFrame()).image;
+        final b = (await styledCodec.getNextFrame()).image;
+        try {
+          final before = (await a.toByteData())!.buffer.asUint8List();
+          final after = (await b.toByteData())!.buffer.asUint8List();
+          var bottom = -1;
+          for (var i = 0; i + 3 < after.length; i += 4) {
+            if (before[i] != after[i] ||
+                before[i + 1] != after[i + 1] ||
+                before[i + 2] != after[i + 2]) {
+              bottom = (i ~/ 4) ~/ b.width;
+            }
+          }
+          return bottom;
+        } finally {
+          a.dispose();
+          b.dispose();
+          cleanCodec.dispose();
+          styledCodec.dispose();
+        }
+      }
+
+      final previous = await subtitleBottom();
+      expect(previous, greaterThan(0));
+      await backend.setSubtitlePresentation(size: 22, height: 180, bottom: 0);
+      final lowest = await subtitleBottom();
+      expect(lowest, greaterThan(previous + 4));
+      expect(await native.getProperty('sub-margin-y'), '0');
+      expect(double.parse(await native.getProperty('sub-pos')), 100);
+    },
+    skip: library == null
+        ? 'Requires the pinned Windows libmpv runtime.'
+        : false,
+  );
+
+  test(
+    'Native subtitle background updates color and alpha without moving text',
+    () async {
+      MediaKit.ensureInitialized(libmpv: library);
+      final player = Player(
+        configuration: const PlayerConfiguration(libass: true, vo: 'null'),
+      );
+      final backend = MediaKitBackend(video: false, player: player);
+      addTearDown(backend.close);
+      final native = player.platform as NativePlayer;
+      await native.setProperty('ao', 'null');
+      await native.setProperty('vid', 'auto');
+      await backend.open(
+        DownloadSpec(
+          url: File('test/fixtures/player-sample.mkv').absolute.path,
+          fileName: 'sample.mkv',
+        ),
+        Duration.zero,
+      );
+      await backend.setSubtitleTrack(
+        SubtitleTrack.uri(
+          File('test/fixtures/player-external.srt').absolute.uri.toString(),
+        ),
+      );
+      await backend.setSubtitlePresentation(size: 22, height: 180, bottom: .1);
+      await backend.play();
+      await until(
+        () =>
+            player.state.position.inMilliseconds >= 1100 &&
+            (player.state.width ?? 0) > 1,
+      );
+      await backend.pause();
+
+      Future<List<int>> pixels(String label) async {
+        final png = (await player.screenshot(
+          format: 'image/png',
+          includeLibassSubtitles: true,
+        ))!;
+        final output = Platform.environment['ASTERLINK_SUBTITLE_SCREENSHOTS'];
+        if (output != null) {
+          await Directory(output).create(recursive: true);
+          await File('$output/$label.png').writeAsBytes(png);
+        }
+        final codec = await ui.instantiateImageCodec(png);
+        final frame = (await codec.getNextFrame()).image;
+        try {
+          return List<int>.of((await frame.toByteData())!.buffer.asUint8List());
+        } finally {
+          frame.dispose();
+          codec.dispose();
+        }
+      }
+
+      final none = await pixels('no-background');
+      expect(double.parse(await native.getProperty('sub-shadow-offset')), 0);
+      expect(double.parse(await native.getProperty('sub-border-size')), 4);
+      await backend.setSubtitlePresentation(
+        size: 22,
+        height: 180,
+        bottom: .1,
+        backgroundColor: 0xffff0000,
+      );
+      final opaque = await pixels('red-opaque');
+      await backend.setSubtitlePresentation(
+        size: 22,
+        height: 180,
+        bottom: .1,
+        backgroundColor: 0x80ff0000,
+      );
+      final half = await pixels('red-half');
+      await backend.setSubtitlePresentation(
+        size: 22,
+        height: 180,
+        bottom: .1,
+        backgroundColor: 0xff0000ff,
+      );
+      final blue = await pixels('blue-opaque');
+      var backgroundPixels = 0;
+      var opacityError = 0.0;
+      for (var i = 0; i + 3 < opaque.length; i += 4) {
+        if (opaque[i] < 250 ||
+            opaque[i + 1] > 5 ||
+            opaque[i + 2] > 5 ||
+            blue[i] > 5 ||
+            blue[i + 1] > 5 ||
+            blue[i + 2] < 250) {
+          continue;
+        }
+        backgroundPixels++;
+        for (var c = 0; c < 3; c++) {
+          final expected = (opaque[i + c] + none[i + c]) / 2;
+          opacityError += (half[i + c] - expected).abs();
+        }
+      }
+      expect(backgroundPixels, greaterThan(100));
+      expect(opacityError / (backgroundPixels * 3), lessThan(3));
+      await backend.setSubtitlePresentation(size: 22, height: 180, bottom: .1);
+      expect(await pixels('cleared-background'), none);
+    },
+    skip: library == null
+        ? 'Requires the pinned Windows libmpv runtime.'
+        : false,
+  );
 
   test(
     'Closing a player does not wait for its font download or attach a late result',

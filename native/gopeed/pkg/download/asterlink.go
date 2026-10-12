@@ -23,6 +23,15 @@ func (t *Task) ConnectionCounts() (active, total int) {
 	return 0, 0
 }
 
+func (t *Task) AliyunTransferState() *fhttp.AliyunTransferState {
+	if source, ok := t.fetcher.(interface {
+		AliyunTransferState() *fhttp.AliyunTransferState
+	}); ok {
+		return source.AliyunTransferState()
+	}
+	return nil
+}
+
 func (t *Task) ReadableRanges() [][2]int64 {
 	if source, ok := t.fetcher.(interface{ ReadableRanges() [][2]int64 }); ok {
 		return source.ReadableRanges()
@@ -95,7 +104,7 @@ func (d *Downloader) PauseAndSave(id string) error {
 
 // Replace only the request after the Android caller has verified the remote identity.
 // Keeping the fetcher's range state avoids losing progress when a signed URL expires.
-func (d *Downloader) ReplacePausedRequest(id string, req *base.Request, connectionProfile string) error {
+func (d *Downloader) ReplacePausedRequest(id string, req *base.Request, connectionProfile string, routeOptions ...*fhttp.OptsExtra) error {
 	task := d.GetTask(id)
 	if task == nil {
 		return ErrTaskNotFound
@@ -122,6 +131,38 @@ func (d *Downloader) ReplacePausedRequest(id string, req *base.Request, connecti
 		extra.ConnectionProfile = connectionProfile
 		if task.fetcher != nil {
 			task.fetcher.Meta().Opts = task.Meta.Opts
+		}
+	}
+	if connectionProfile == "baidu_public" && len(routeOptions) == 1 && routeOptions[0] != nil {
+		if err := base.ParseOptsExtra[fhttp.OptsExtra](task.Meta.Opts); err != nil {
+			return err
+		}
+		if task.Meta.Opts.Extra == nil {
+			task.Meta.Opts.Extra = &fhttp.OptsExtra{}
+		}
+		extra := task.Meta.Opts.Extra.(*fhttp.OptsExtra)
+		extra.ConnectionProfile = "baidu_public"
+		extra.Connections = max(1, min(512, routeOptions[0].Connections))
+		if task.fetcher != nil {
+			task.fetcher.Meta().Opts = task.Meta.Opts
+		}
+	}
+	if connectionProfile == "aliyun" && len(routeOptions) == 1 && routeOptions[0] != nil {
+		if err := base.ParseOptsExtra[fhttp.OptsExtra](task.Meta.Opts); err != nil {
+			return err
+		}
+		if task.Meta.Opts.Extra == nil {
+			task.Meta.Opts.Extra = &fhttp.OptsExtra{}
+		}
+		extra := task.Meta.Opts.Extra.(*fhttp.OptsExtra)
+		extra.ConnectionProfile = "aliyun"
+		extra.Connections = max(1, min(8, routeOptions[0].Connections))
+		extra.AliyunGroup = routeOptions[0].AliyunGroup
+		if task.fetcher != nil {
+			task.fetcher.Meta().Opts = task.Meta.Opts
+			if policy, ok := task.fetcher.(interface{ PrepareAliyunTransfer(string, int) }); ok {
+				policy.PrepareAliyunTransfer(extra.AliyunGroup, extra.Connections)
+			}
 		}
 	}
 	task.Meta.Req = req

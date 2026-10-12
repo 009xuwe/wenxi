@@ -32,6 +32,9 @@ String safeRelativePath(String raw) => raw
     .join(p.separator);
 
 abstract class FileAccess {
+  // Android document providers are not filesystem paths. Keep their existing
+  // private cache; desktop payloads can live beside the chosen destination.
+  Future<String?> downloadCacheRoot(String? destination) async => null;
   Future<StoragePlan> storagePlan(String cache, String? destination) async =>
       StoragePlan(StorageVolume('cache', cache), StorageVolume('cache', cache));
   Future<FileAvailability> inspect(String? path);
@@ -89,6 +92,14 @@ class PlatformFileAccess implements FileAccess {
     if (callback != null && callback.$1 == value.integer('token')) {
       callback.$2(value.integer('copied'), value.integer('total'));
     }
+  }
+
+  @override
+  Future<String?> downloadCacheRoot(String? destination) async {
+    if (_android) return null;
+    final target = destination ?? defaultDirectory.path;
+    require(p.isAbsolute(target), '请选择有效的下载目录');
+    return p.normalize(p.join(target, GopeedEngine.destinationCacheName));
   }
 
   @override

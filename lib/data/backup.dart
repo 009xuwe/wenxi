@@ -6,6 +6,8 @@ import '../domain/models.dart';
 import '../domain/settings.dart';
 import 'state_store.dart';
 import 'cloud_favorites.dart';
+import 'backgrounds.dart';
+import '../domain/background.dart';
 
 const backupSecretKeys = {
   'pan123.login_uuid',
@@ -88,9 +90,13 @@ Json decryptBackup((Uint8List, String) input) {
 }
 
 class BackupRepository {
-  BackupRepository(this.store);
+  BackupRepository(this.store, {this.backgrounds});
   final StateStore store;
-  Future<Uint8List> create(String password) async {
+  final BackgroundRepository? backgrounds;
+  Future<Uint8List> create(
+    String password, {
+    bool includeBackgroundImages = false,
+  }) async {
     require(password.length >= 6, '备份密码至少需要 6 位');
     final credentials = store.data.obj('credentials'),
         secrets = store.data.obj('secrets');
@@ -100,12 +106,24 @@ class BackupRepository {
     ];
     final settings = AppSettings.fromJson(store.data.obj('settings')).toJson()
       ..remove('destination');
-    return compute(encryptBackup, (
+    final background = BackgroundSettings.fromJson(settings.obj('background'));
+    final images = includeBackgroundImages && background.hasImage
+        ? await backgrounds?.exportImages(background)
+        : null;
+    require(
+      !includeBackgroundImages || !background.hasImage || images != null,
+      '当前环境无法备份背景图片',
+    );
+    if (images == null) {
+      settings['background'] = background.withoutImages().toJson();
+    }
+    final bytes = await compute(encryptBackup, (
       {
         'schema': 1,
         'package': 'com.asterlink.app',
         'createdAt': DateTime.now().millisecondsSinceEpoch,
         'settings': settings,
+        'backgroundImages': ?images,
         'credentials': [
           for (final p in CloudPlatform.values)
             if (credentials[p.key] != null)
@@ -145,6 +163,8 @@ class BackupRepository {
       },
       password,
     ));
+    require(bytes.length <= 16 * 1024 * 1024, '备份文件过大，请取消携带背景图后重试');
+    return bytes;
   }
 
   Future<int> restore(Uint8List bytes, String password) async {
@@ -242,88 +262,108 @@ class BackupRepository {
       }
       require(favorites.length <= 2000, '备份收藏数量过多');
     }
-    await store.change((draft) {
-      Vault.migrateDraft(draft);
-      if (accounts != null) {
-        final all = draft.obj('cloudAccounts');
-        for (final item in accounts) {
-          final platform = CloudPlatform.fromKey(item.str('platform'))!;
-          final records = all.obj(platform.key);
-          var revision = DateTime.now().millisecondsSinceEpoch;
-          for (final record in records.values) {
-            final previous = asJson(
-              record,
-            ).obj('credential').integer('updatedAt');
-            if (revision <= previous) revision = previous + 1;
+    Object? backgroundDraft;
+    try {
+      if (settings != null) {
+        final background = BackgroundSettings.fromJson(
+          settings.obj('background'),
+        );
+        if (backgrounds != null) {
+          backgroundDraft = backgrounds!.beginDraft();
+          settings['background'] = (await backgrounds!.restoreImages(
+            background,
+            payload['backgroundImages'],
+            backgroundDraft,
+          )).toJson();
+        } else {
+          settings['background'] = background.withoutImages().toJson();
+        }
+      }
+      await store.change((draft) {
+        Vault.migrateDraft(draft);
+        if (accounts != null) {
+          final all = draft.obj('cloudAccounts');
+          for (final item in accounts) {
+            final platform = CloudPlatform.fromKey(item.str('platform'))!;
+            final records = all.obj(platform.key);
+            var revision = DateTime.now().millisecondsSinceEpoch;
+            for (final record in records.values) {
+              final previous = asJson(
+                record,
+              ).obj('credential').integer('updatedAt');
+              if (revision <= previous) revision = previous + 1;
+            }
+            final restored = Credential.fromJson(item.obj('credential'));
+            records[item.str('id')] = {
+              'name': item.str('name'),
+              if (item.containsKey('nameIsCustom'))
+                'nameIsCustom': item.boolean('nameIsCustom'),
+              'secrets': item.obj('secrets'),
+              'credential': Credential(
+                restored.label,
+                restored.fields,
+                updatedAt: revision,
+              ).toJson(),
+            };
+            all[platform.key] = records;
           }
-          final restored = Credential.fromJson(item.obj('credential'));
-          records[item.str('id')] = {
-            'name': item.str('name'),
-            if (item.containsKey('nameIsCustom'))
-              'nameIsCustom': item.boolean('nameIsCustom'),
-            'secrets': item.obj('secrets'),
-            'credential': Credential(
-              restored.label,
-              restored.fields,
-              updatedAt: revision,
-            ).toJson(),
+          draft['cloudAccounts'] = all;
+          for (final platform in CloudPlatform.values) {
+            final selected = payload
+                .obj('activeCloudAccounts')
+                .str(platform.key)
+                .ifEmpty(Vault.activeIdIn(draft, platform) ?? '');
+            if (selected.isNotEmpty) {
+              Vault.activateDraft(draft, platform, selected);
+            }
+          }
+          final merged = {
+            for (final f in draft.list('cloudFavorites')) f.str('id'): f,
           };
-          all[platform.key] = records;
-        }
-        draft['cloudAccounts'] = all;
-        for (final platform in CloudPlatform.values) {
-          final selected = payload
-              .obj('activeCloudAccounts')
-              .str(platform.key)
-              .ifEmpty(Vault.activeIdIn(draft, platform) ?? '');
-          if (selected.isNotEmpty) {
-            Vault.activateDraft(draft, platform, selected);
+          for (final f in favorites) {
+            final owner = f.str('accountId'),
+                platform = CloudPlatform.fromKey(f.str('platform'))!;
+            if (owner.isEmpty ||
+                Vault.credentialIn(draft, platform, owner) != null) {
+              merged[f.str('id')] = f;
+            }
           }
+          require(merged.length <= 2000, '合并后收藏超过 2000 项，请先清理收藏');
+          draft['cloudFavorites'] = merged.values.toList();
+          if (settings != null) draft['settings'] = settings;
+          return;
         }
-        final merged = {
-          for (final f in draft.list('cloudFavorites')) f.str('id'): f,
+        // Account revisions invalidate pending requests and saved download sources.
+        // A restore must advance them even when two changes share a millisecond.
+        for (final entry in credentials.entries.toList()) {
+          final restored = Credential.fromJson(asJson(entry.value));
+          final previous = draft
+              .obj('credentials')
+              .obj(entry.key)
+              .integer('updatedAt');
+          final now = DateTime.now().millisecondsSinceEpoch;
+          credentials[entry.key] = Credential(
+            restored.label,
+            restored.fields,
+            updatedAt: now > previous ? now : previous + 1,
+          ).toJson();
+        }
+        draft['credentials'] = {...draft.obj('credentials'), ...credentials};
+        final previousSecrets = draft.obj('secrets');
+        if (credentials.containsKey(CloudPlatform.pan123.key)) {
+          previousSecrets.remove('pan123.access_token');
+        }
+        draft['secrets'] = {
+          ...previousSecrets,
+          for (final k in backupSecretKeys)
+            if (secrets[k] != null) k: secrets[k],
         };
-        for (final f in favorites) {
-          final owner = f.str('accountId'),
-              platform = CloudPlatform.fromKey(f.str('platform'))!;
-          if (owner.isEmpty ||
-              Vault.credentialIn(draft, platform, owner) != null) {
-            merged[f.str('id')] = f;
-          }
-        }
-        require(merged.length <= 2000, '合并后收藏超过 2000 项，请先清理收藏');
-        draft['cloudFavorites'] = merged.values.toList();
         if (settings != null) draft['settings'] = settings;
-        return;
-      }
-      // Account revisions invalidate pending requests and saved download sources.
-      // A restore must advance them even when two changes share a millisecond.
-      for (final entry in credentials.entries.toList()) {
-        final restored = Credential.fromJson(asJson(entry.value));
-        final previous = draft
-            .obj('credentials')
-            .obj(entry.key)
-            .integer('updatedAt');
-        final now = DateTime.now().millisecondsSinceEpoch;
-        credentials[entry.key] = Credential(
-          restored.label,
-          restored.fields,
-          updatedAt: now > previous ? now : previous + 1,
-        ).toJson();
-      }
-      draft['credentials'] = {...draft.obj('credentials'), ...credentials};
-      final previousSecrets = draft.obj('secrets');
-      if (credentials.containsKey(CloudPlatform.pan123.key)) {
-        previousSecrets.remove('pan123.access_token');
-      }
-      draft['secrets'] = {
-        ...previousSecrets,
-        for (final k in backupSecretKeys)
-          if (secrets[k] != null) k: secrets[k],
-      };
-      if (settings != null) draft['settings'] = settings;
-      Vault.migrateDraft(draft);
-    }, recoveryPassword: password);
+        Vault.migrateDraft(draft);
+      }, recoveryPassword: password);
+    } finally {
+      if (backgroundDraft != null) await backgrounds!.endDraft(backgroundDraft);
+    }
     return accounts?.length ?? credentials.length;
   }
 }
